@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 15:52:04 -0800
+Subject: [PATCH] [QW38] gdn recover fold test: poison never-written blocks in
+ the fold path only
+
+Replaces the zeroing from 0038 (it would also hide a read-before-store).
+Recycled / not-yet-crossed blocks are zeros in the reference but poisoned in
+the fold path (int16 codes -32768 + NaN row scales; NaN fp32). The gate now
+requires bit-exact verify outputs with no NaN, and bit-exact crossed boundary
+blocks (tracked per request). New negative control: the fold path verifies
+off a poisoned block and must fail; plus a check that align runs cross.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/mamba/test_gdn_recover_fold.py | 80 ++++++++++++++++----
+ 1 file changed, 66 insertions(+), 14 deletions(-)
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_fold.py b/tests/kernels/mamba/test_gdn_recover_fold.py
+index f778066e4..2f7fecf6c 100644
+--- a/tests/kernels/mamba/test_gdn_recover_fold.py
++++ b/tests/kernels/mamba/test_gdn_recover_fold.py
+@@ -71,12 +71,16 @@ class _Req:
+     def __init__(self, rid, row, run_slot, blocks, computed):
+         self.rid, self.row, self.run_slot = rid, row, run_slot
+         self.blocks, self.computed = blocks, computed
++        self.crossed: set[int] = set()  # boundary blocks written by a commit
+ 
+ 
+ class _Sim:
+-    def __init__(self, fmt, graph, align, mixed, seed, reset=True):
++    def __init__(self, fmt, graph, align, mixed, seed, reset=True, stale_read=False):
+         self.fmt, self.graph, self.align, self.mixed = fmt, graph, align, mixed
+         self.reset = reset
++        # Negative control: the fold path verifies one request off a poisoned
++        # (never written) block, as a read-before-store bug would.
++        self.stale_read = stale_read
+         self.rng = random.Random(seed)
+         self.gen = torch.Generator(device=DEV).manual_seed(seed)
+         grs._DEFER_TRACKERS.clear()
+@@ -167,12 +171,21 @@ class _Sim:
+                 b = self.rng.choice(self.free_slots)
+                 self.free_slots.remove(b)
+                 r.blocks.append(b)
+-                # A recycled block holds stale content, which legitimately
+-                # differs between the paths (a finished request's last
+-                # records are never folded); nothing reads it before a
+-                # boundary store, so start both copies from the same bits.
+-                for s in self.ref_states + self.fold_states + (self.prev_ref or []):
+-                    s[b].zero_()
++                self._poison(b)
++
++    def _poison(self, b):
++        """A recycled / not-yet-crossed block: zeros in the reference, poison
++        in the fold path only (int16 codes -32768 with NaN row scales; NaN
++        fp32). Any fold-path read of it before its boundary store turns the
++        outputs NaN, and an unwritten crossed block cannot match."""
++        for s in self.ref_states + (self.prev_ref or []):
++            s[b].zero_()
++        for s in self.fold_states:
++            if self.fmt == "int16_row":
++                s[b, :, :V].fill_(-32768)
++                s[b, :, V:].view(torch.float32).fill_(float("nan"))
++            else:
++                s[b].fill_(float("nan"))
+ 
+     # ---- graph mode ------------------------------------------------------------
+     def _init_graph(self):
+@@ -259,6 +272,16 @@ class _Sim:
+         slots = torch.tensor([r.run_slot for r in batch], dtype=torch.int32)
+         reqs = torch.tensor([r.row for r in batch], dtype=torch.int32)
+         cu_d, slots_d, reqs_d = cu.to(DEV), slots.to(DEV), reqs.to(DEV)
++        fold_slots_d = slots_d
++        if self.stale_read:
++            b = self.rng.choice(self.free_slots)
++            self.free_slots.remove(b)
++            self._poison(b)
++            batch[0].blocks.append(b)  # freed with the request
++            fold_slots_d = slots_d.clone()
++            fold_slots_d[0] = b
++            for s_ref, s_fold in zip(self.ref_states, self.fold_states):
++                s_ref[b] = s_ref[slots[0]]  # reference reads the right state
+         num_acc_d, bt_d, nc_d = num_acc.to(DEV), block_table.to(DEV), num_comp.to(DEV)
+         row_idx = torch.tensor(rows, dtype=torch.int32, device=DEV) if self.mixed else None
+         conv = 2 * H * K + HV * V
+@@ -294,7 +317,7 @@ class _Sim:
+             self.g_cu.fill_(T)
+             self.g_cu[: N + 1].copy_(cu_d)
+             self.g_slot.zero_()
+-            self.g_slot[:N].copy_(slots_d)
++            self.g_slot[:N].copy_(fold_slots_d)
+             self.g_req.zero_()
+             self.g_req[:N].copy_(reqs_d)
+             self.graph_obj.replay()
+@@ -303,7 +326,7 @@ class _Sim:
+             # Padded rows (slot 0, request row 0) as the builder stages them.
+             pad = rng.randint(0, 2)
+             cu_p = torch.cat([cu_d, cu_d[-1:].repeat(pad)])
+-            sl_p = torch.cat([slots_d, torch.zeros(pad, dtype=torch.int32, device=DEV)])
++            sl_p = torch.cat([fold_slots_d, torch.zeros(pad, dtype=torch.int32, device=DEV)])
+             rq_p = torch.cat([reqs_d, torch.zeros(pad, dtype=torch.int32, device=DEV)])
+             fold_out = [
+                 gdn_recover_verify(
+@@ -314,6 +337,7 @@ class _Sim:
+                 for i in range(L)
+             ]
+         for i in range(L):
++            assert torch.isfinite(fold_out[i].float()).all(), f"layer {i}: NaN/inf in fold output"
+             _eq(fold_out[i], ref_out[i], f"layer {i} verify output")
+         # The fold verify stored the previous step's committed state in place.
+         if self.prev_ref is not None:
+@@ -334,14 +358,21 @@ class _Sim:
+             slots_d, cu_d, num_acc_d, reqs_d, row_indices=row_idx, **align
+         )
+         torch.cuda.synchronize()
+-        # Boundary blocks are written at commit time in both paths.
++        # Boundary blocks are written at commit time in both paths: every
++        # crossed block (poisoned in the fold path until then) must match.
+         if self.align:
++            for n, r in enumerate(batch):
++                acc_n = max(1, min(int(num_acc[rows[n]]), qlens[n]))
++                nb = (r.computed // BS + 1) * BS
++                if nb - r.computed <= acc_n:
++                    b = r.blocks[r.computed // BS]
++                    if b != r.run_slot:
++                        r.crossed.add(b)
+             for i in range(L):
+                 for r in self.reqs.values():
+-                    for b in r.blocks:
+-                        if b != r.run_slot:
+-                            _eq(self.fold_states[i][b], self.ref_states[i][b],
+-                                f"layer {i} boundary block {b}")
++                    for b in r.crossed:
++                        _eq(self.fold_states[i][b], self.ref_states[i][b],
++                            f"layer {i} crossed boundary block {b}")
+         self.prev_ref = [s.clone() for s in self.ref_states]
+         # Advance computed tokens by the accepted count (clamped as the plan).
+         for n, r in enumerate(batch):
+@@ -369,3 +400,24 @@ def test_recover_fold_detects_missing_admission_reset():
+     with pytest.raises(AssertionError):
+         for _ in range(200):
+             sim.step()
++
++
++@pytest.mark.parametrize("fmt", ["int16_row", "fp32"])
++def test_recover_fold_detects_stale_block_read(fmt):
++    """Negative control: verifying off a never-written (poisoned) block must
++    fail the gate (NaN output / mismatch)."""
++    sim = _Sim(fmt, False, True, False, seed=11, stale_read=True)
++    with pytest.raises(AssertionError):
++        for _ in range(5):
++            sim.step()
++
++
++def test_recover_fold_crossings_exercised():
++    """The align runs really cross boundaries (otherwise the block check is
++    vacuous)."""
++    sim = _Sim("int16_row", False, True, True, seed=3)
++    n = 0
++    for _ in range(40):
++        sim.step()
++        n = max(n, sum(len(r.crossed) for r in sim.reqs.values()))
++    assert n >= 3

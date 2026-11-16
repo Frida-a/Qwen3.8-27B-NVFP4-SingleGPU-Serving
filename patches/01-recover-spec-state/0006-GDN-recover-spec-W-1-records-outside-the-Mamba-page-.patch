@@ -1,0 +1,562 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:54:13 -0800
+Subject: [PATCH] [GDN] recover spec W=1: records outside the Mamba page (same
+ block size)
+
+With prefix caching the hybrid block size is derived from the Mamba page
+size, so recover's record ring in the page (3,412,928 vs 3,268,608 B for
+Qwen3.8 k=3) gave 1728- instead of 1600-token blocks and different cache-hit
+granularity than the per-token path (RTX PRO 6000: 5184 vs 4800 hit tokens = 3 blocks
+each). The scheduler's bookkeeping itself caches the same blocks for
+num_speculative_blocks K vs 0 (new CPU test with the real Scheduler).
+
+With W = 1 every step folds its records, so they now live in a per-layer
+row buffer [max_num_seqs, ...] outside the KV cache (allocated at model init,
+counted by the memory profile; R = num_spec + 1) and the page is
+byte-identical to the per-token path's. W > 1 keeps the persistent ring in
+the page. Kernels index records by spec row (RECORDS_BY_ROW) or by slot.
+
+Tests: kernel bit-exactness for row and slot records; model-path and align
+tests use row records for W = 1; tests/v1/core/test_mamba_recover_spec_caching.py
+compares cached block sets and the turn-2 hit across modes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/mamba/test_gdn_recover_align.py |  19 +--
+ .../mamba/test_gdn_recover_model_path.py      |  14 ++-
+ tests/kernels/mamba/test_gdn_recover_spec.py  |  22 ++--
+ .../core/test_mamba_recover_spec_caching.py   | 114 ++++++++++++++++++
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  |  22 +++-
+ .../layers/mamba/mamba_utils.py               |  12 +-
+ .../layers/mamba/ops/gdn_recover_spec.py      |  52 ++++++--
+ vllm/v1/attention/backends/gdn_attn.py        |   7 +-
+ 8 files changed, 229 insertions(+), 33 deletions(-)
+ create mode 100644 tests/v1/core/test_mamba_recover_spec_caching.py
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_align.py b/tests/kernels/mamba/test_gdn_recover_align.py
+index 1cd0d9e61..718b1101c 100644
+--- a/tests/kernels/mamba/test_gdn_recover_align.py
++++ b/tests/kernels/mamba/test_gdn_recover_align.py
+@@ -38,6 +38,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
+     MambaStateCopyFuncCalculator,
+     MambaStateShapeCalculator,
+ )
++from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (  # noqa: E402
++    GDNRecoverRecords,
++)
+ from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
+     GDNAttentionMetadataBuilder,
+     GDNRecoverSpecMetadata,
+@@ -93,18 +96,19 @@ def _run(monkeypatch, mode, computed0, steps, inputs, accepted, init, params):
+     num_slots = 1 + N * COLS
+     conv = torch.zeros(num_slots, *shapes[0], device=DEV, dtype=torch.bfloat16)
+     ssm = torch.zeros(num_slots, *shapes[1], device=DEV)
++    # W = 1: the page is identical to the per-token path's (same block size);
++    # the records live in one row per spec request.
++    assert len(shapes) == 2
+     kv_cache = [conv, ssm]
++    records = None
+     if recover:
+-        kv_cache += [
+-            torch.zeros(num_slots, *shapes[2], device=DEV),
+-            torch.zeros(num_slots, *shapes[3], device=DEV, dtype=torch.bfloat16),
+-            torch.zeros(num_slots, *shapes[4], device=DEV),
+-        ]
++        records = GDNRecoverRecords.allocate(
++            N, H, HV, K, V, NUM_SPEC, torch.bfloat16, DEV, by_row=True
++        )
+     spec = MambaSpec(
+         block_size=BS,
+         shapes=tuple(shapes),
+-        dtypes=(torch.bfloat16, torch.float32)
+-        + ((torch.float32, torch.bfloat16, torch.float32) if recover else ()),
++        dtypes=(torch.bfloat16, torch.float32),
+         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+         mamba_cache_mode="align",
+         num_speculative_blocks=0 if recover else NUM_SPEC,
+@@ -133,6 +137,7 @@ def _run(monkeypatch, mode, computed0, steps, inputs, accepted, init, params):
+         use_flashinfer_replayssm=False,
+         gdn_decode_kernel="triton",
+         gdn_prefill_backend="triton",
++        _recover_records=records,
+     )
+     for name in ("rearrange_mixed_qkv", "_forward_core", "_recover_spec_verify"):
+         fn = getattr(QwenGatedDeltaNetAttention, name)
+diff --git a/tests/kernels/mamba/test_gdn_recover_model_path.py b/tests/kernels/mamba/test_gdn_recover_model_path.py
+index f4c29e793..5d01e5c9b 100644
+--- a/tests/kernels/mamba/test_gdn_recover_model_path.py
++++ b/tests/kernels/mamba/test_gdn_recover_model_path.py
+@@ -38,6 +38,9 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa:
+ from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
+     MambaStateShapeCalculator,
+ )
++from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (  # noqa: E402
++    GDNRecoverRecords,
++)
+ from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
+     GDNAttentionMetadataBuilder,
+     GDNRecoverSpecMetadata,
+@@ -102,12 +105,18 @@ class _Run:
+         shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+             1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
+         )
+-        assert len(shapes) == (5 if recover else 2)
++        # W = 1 keeps the page identical to per_token (records by row).
++        assert len(shapes) == (5 if recover and window > 1 else 2)
+         conv = torch.zeros(num_slots, *shapes[0], device=DEV, dtype=torch.bfloat16)
+         ssm = torch.zeros(num_slots, *shapes[1], device=DEV)
+         conv[self.table[:, 0].long()], ssm[self.table[:, 0].long()] = init
+         kv_cache = (conv, ssm)
+-        if recover:
++        records = None
++        if recover and window == 1:
++            records = GDNRecoverRecords.allocate(
++                num_reqs, H, HV, K, V, NUM_SPEC, torch.bfloat16, DEV, by_row=True
++            )
++        elif recover:
+             assert shapes[2][1] == window + NUM_SPEC + 1
+             kv_cache += (
+                 torch.zeros(num_slots, *shapes[2], device=DEV),
+@@ -139,6 +148,7 @@ class _Run:
+                 num_slots, dtype=torch.int32, device=DEV
+             ),
+             gdn_decode_kernel="triton",
++            _recover_records=records,
+         )
+         with set_current_vllm_config(self.vllm_config):
+             layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+diff --git a/tests/kernels/mamba/test_gdn_recover_spec.py b/tests/kernels/mamba/test_gdn_recover_spec.py
+index 8152e6209..b34e38717 100644
+--- a/tests/kernels/mamba/test_gdn_recover_spec.py
++++ b/tests/kernels/mamba/test_gdn_recover_spec.py
+@@ -112,12 +112,15 @@ def _reference(step: _Step, A_log, dt_bias, s0: torch.Tensor, t_max: int):
+     return o.squeeze(0), pool, idx
+ 
+ 
+-def _new_cache(N, gen, num_spec, window=1, num_v_heads=HV, extra_slots=0):
++def _new_cache(N, gen, num_spec, window=1, num_v_heads=HV, extra_slots=0, by_row=False):
+     num_slots = 1 + N + extra_slots
+     state = torch.randn((num_slots, num_v_heads, V, K), generator=gen, device=DEV)
++    # by_row: one record row per request of the step (W = 1), else per slot.
+     rec = GDNRecoverRecords.allocate(
+-        num_slots, H, num_v_heads, K, V, num_spec, torch.bfloat16, DEV, window
+-    )
++        N if by_row else num_slots,
++        H, num_v_heads, K, V, num_spec, torch.bfloat16, DEV, window,
++        by_row=by_row,
++    )  # fmt: skip
+     return state, rec
+ 
+ 
+@@ -130,7 +133,8 @@ def _rand_qlens(N, t_max, gen, ragged):
+ @pytest.mark.parametrize("t_max", [4, 8])
+ @pytest.mark.parametrize("N", [1, 4, 32])
+ @pytest.mark.parametrize("ragged", [False, True])
+-def test_verify_commit_bitexact(N, t_max, ragged):
++@pytest.mark.parametrize("by_row", [False, True])
++def test_verify_commit_bitexact(N, t_max, ragged, by_row):
+     if INTERPRET and N > 4:
+         pytest.skip("slow under the interpreter")
+     gen = torch.Generator(device=DEV).manual_seed(1000 * N + t_max + ragged)
+@@ -138,7 +142,7 @@ def test_verify_commit_bitexact(N, t_max, ragged):
+     qlens = _rand_qlens(N, t_max, cpu_gen, ragged)
+     step = _Step(qlens, gen)
+     A_log, dt_bias = _params(gen)
+-    state, rec = _new_cache(N, gen, num_spec=t_max - 1)
++    state, rec = _new_cache(N, gen, num_spec=t_max - 1, by_row=by_row)
+     slots = torch.arange(1, N + 1, dtype=torch.int32, device=DEV)
+     s0 = state[1:].clone()
+ 
+@@ -332,8 +336,9 @@ def test_align_boundary_from_block_table():
+     A_log, dt_bias = _params(gen)
+     num_slots = 1 + N * cols
+     state = torch.randn((num_slots, HV, V, K), generator=gen, device=DEV)
++    # Production align config (W = 1): records by row.
+     rec = GDNRecoverRecords.allocate(
+-        num_slots, H, HV, K, V, t_max - 1, torch.bfloat16, DEV
++        N, H, HV, K, V, t_max - 1, torch.bfloat16, DEV, by_row=True
+     )
+     table = (1 + torch.arange(N * cols, dtype=torch.int32, device=DEV)).view(N, cols)
+     run_col = [(c + t_max - 1) // bs for c in computed]  # (seq_len - 1) // bs
+@@ -372,7 +377,8 @@ def test_align_boundary_from_block_table():
+             _assert_bitexact(state[sl], before[sl], f"untouched slot {sl}")
+ 
+ 
+-def test_multilayer_commit_and_row_indices():
++@pytest.mark.parametrize("by_row", [False, True])
++def test_multilayer_commit_and_row_indices(by_row):
+     """One launch commits several layers; spec rows map to batch rows."""
+     N, t_max, L = 4, 4, 3
+     gen = torch.Generator(device=DEV).manual_seed(11)
+@@ -385,7 +391,7 @@ def test_multilayer_commit_and_row_indices():
+     states, recs, refs = [], [], []
+     for _ in range(L):
+         step = _Step(qlens, gen)
+-        state, rec = _new_cache(N, gen, num_spec=t_max - 1)
++        state, rec = _new_cache(N, gen, num_spec=t_max - 1, by_row=by_row)
+         o_ref, pool, idx = _reference(step, A_log, dt_bias, state[1:].clone(), t_max)
+         gdn_recover_verify(
+             step.q, step.k, step.v, step.a, step.b, A_log, dt_bias,
+diff --git a/tests/v1/core/test_mamba_recover_spec_caching.py b/tests/v1/core/test_mamba_recover_spec_caching.py
+new file mode 100644
+index 000000000..5fa714700
+--- /dev/null
++++ b/tests/v1/core/test_mamba_recover_spec_caching.py
+@@ -0,0 +1,114 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prefix caching with GDN spec decode: per-token state columns
++(num_speculative_blocks = K) vs VLLM_GDN_SPEC_STATE=recover (one running
++block, num_speculative_blocks = 0) must cache exactly the same Mamba blocks
++for the same request sequence, so a follow-up turn gets the same hit.
++
++(At equal block size. Recover W > 1 keeps its record ring in the Mamba page,
++which grows the page and therefore the hybrid block size; W = 1 keeps the
++page identical to the per-token path's.)
++"""
++
++import random
++
++import pytest
++import torch
++
++from vllm.sampling_params import SamplingParams
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_utils import get_request_block_hasher
++from vllm.v1.kv_cache_interface import MambaSpec
++from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
++from vllm.v1.request import Request, RequestStatus
++
++from .utils import EOS_TOKEN_ID, create_requests, create_scheduler
++
++pytestmark = pytest.mark.cpu_test
++
++BLOCK_SIZE = 16
++NUM_SPEC = 3
++
++
++def _request(req_id: str, prompt: list[int], max_tokens: int) -> Request:
++    params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
++    params.update_from_generation_config({}, EOS_TOKEN_ID)
++    return Request(
++        request_id=req_id,
++        prompt_token_ids=prompt,
++        sampling_params=params,
++        pooling_params=None,
++        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
++    )
++
++
++def _run(num_speculative_blocks: int, prompt_len: int, accepted: list[int]):
++    scheduler = create_scheduler(
++        model="Qwen/Qwen3-0.6B",
++        enable_prefix_caching=True,
++        num_speculative_tokens=NUM_SPEC,
++        speculative_method="ngram_gpu",
++        block_size=BLOCK_SIZE,
++        kv_cache_spec=MambaSpec(
++            block_size=BLOCK_SIZE,
++            shapes=((1, 1),),
++            dtypes=(torch.float32,),
++            mamba_cache_mode="align",
++            num_speculative_blocks=num_speculative_blocks,
++        ),
++    )
++    create_requests(num_requests=1, block_size=BLOCK_SIZE)  # init the none hash
++    prompt = [(7 * i) % 50 + 1 for i in range(prompt_len)]
++    req = _request("turn1", prompt, max_tokens=10_000)
++    scheduler.add_request(req)
++    # Prefill (possibly chunked) until the first sampled token.
++    while True:
++        out = scheduler.schedule()
++        done = req.num_computed_tokens + out.num_scheduled_tokens[req.request_id]
++        sampled = [[1000]] if done >= len(prompt) else [[]]
++        scheduler.update_from_output(
++            out, ModelRunnerOutput(req_ids=[req.request_id], sampled_token_ids=sampled)
++        )
++        if done >= len(prompt):
++            break
++    # Spec decode steps crossing several block boundaries.
++    next_tok = 1001
++    for a in accepted:
++        scheduler.update_draft_token_ids(
++            DraftTokenIds([req.request_id], [list(range(2000, 2000 + NUM_SPEC))])
++        )
++        out = scheduler.schedule()
++        assert out.num_scheduled_tokens[req.request_id] == 1 + NUM_SPEC
++        toks = list(range(next_tok, next_tok + a))
++        next_tok += a
++        scheduler.update_from_output(
++            out, ModelRunnerOutput(req_ids=[req.request_id], sampled_token_ids=[toks])
++        )
++    turn1_tokens = list(req.all_token_ids)
++    pool = scheduler.kv_cache_manager.block_pool
++    cached = [
++        i
++        for i, h in enumerate(req.block_hashes)
++        if pool.get_cached_block(h, kv_cache_group_ids=[0]) is not None
++    ]
++    scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_STOPPED)
++    # Turn 2: the whole turn-1 sequence plus a new user turn.
++    req2 = _request("turn2", turn1_tokens + list(range(3000, 3040)), max_tokens=4)
++    _, hit, _ = scheduler.kv_cache_manager.get_computed_blocks(req2)
++    return cached, hit, len(turn1_tokens)
++
++
++@pytest.mark.parametrize("seed", range(4))
++@pytest.mark.parametrize("prompt_len", [37, 45, 64])
++def test_recover_caches_same_blocks_as_per_token(seed, prompt_len):
++    rng = random.Random(seed)
++    accepted = [rng.randint(1, NUM_SPEC + 1) for _ in range(25)]
++    per_token = _run(NUM_SPEC, prompt_len, accepted)
++    recover = _run(0, prompt_len, accepted)
++    cached_pt, hit_pt, n_tokens = per_token
++    cached_rec, hit_rec, _ = recover
++    # Decode crossed block boundaries and published some of them.
++    assert n_tokens > prompt_len + 2 * BLOCK_SIZE
++    assert cached_pt, "per-token path cached nothing"
++    assert cached_rec == cached_pt
++    assert hit_rec == hit_pt
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index a04b8a33e..caf2d20f8 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -884,6 +884,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         if self.uses_gdn_recover_trackers:
+             self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
+             self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
++        # W = 1: one record row per spec request of a step, outside the KV
++        # cache (allocated with the model, so the memory profile counts it).
++        self._recover_records: GDNRecoverRecords | None = None
++        if self.spec_recover and self.recover_window == 1:
++            self._recover_records = GDNRecoverRecords.allocate(
++                vllm_config.scheduler_config.max_num_seqs,
++                self.num_k_heads // self.tp_size,
++                self.num_v_heads // self.tp_size,
++                self.head_k_dim,
++                self.head_v_dim,
++                self.num_spec,
++                vllm_config.model_config.dtype,
++                current_platform.current_device(),
++                by_row=True,
++            )
+         if self.spec_recover:
+             reason = self._spec_recover_unsupported_reason(vllm_config)
+             if reason is not None:
+@@ -2224,8 +2239,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             out = mixed_qkv_spec.new_empty(
+                 (1, num_tokens, num_v_heads, self.head_v_dim)
+             )
+-        _, ssm_state, rec_u, rec_k, rec_g = self.kv_cache
++        ssm_state = self.kv_cache[1]
+         window = getattr(self, "recover_window", 1)
++        records = getattr(self, "_recover_records", None)
++        if records is None:
++            records = GDNRecoverRecords(*self.kv_cache[2:5])
+         trackers = None
+         if window > 1:
+             trackers = GDNRecoverTrackers(
+@@ -2240,7 +2258,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             self.A_log,
+             self.dt_bias,
+             ssm_state,
+-            GDNRecoverRecords(rec_u, rec_k, rec_g),
++            records,
+             cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
+             slot_indices=spec_state_indices[:, 0],
+             out=out[0],
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 7b8c8f425..9db714a87 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -64,6 +64,14 @@ def gdn_spec_recover_enabled(num_spec: int) -> bool:
+     return num_spec > 0 and envs.VLLM_GDN_SPEC_STATE.lower() == "recover"
+ 
+ 
++def gdn_spec_recover_ring_in_page(num_spec: int) -> bool:
++    """Recover mode keeps its record ring in the Mamba page only for W > 1
++    (records pending across steps). With W = 1 the records live in a
++    per-step buffer, so the page -- and with prefix caching the hybrid block
++    size -- is identical to the per-token path's."""
++    return gdn_spec_recover_enabled(num_spec) and gdn_spec_recover_window() > 1
++
++
+ def gdn_spec_recover_window() -> int:
+     """Commit window W of VLLM_GDN_SPEC_STATE=recover (VLLM_GDN_SPEC_STATE_W)."""
+     window = envs.VLLM_GDN_SPEC_STATE_W
+@@ -151,7 +159,7 @@ class MambaStateDtypeCalculator:
+         dtypes = cls._mamba_state_dtype(
+             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+         )
+-        if gdn_spec_recover_enabled(num_spec):
++        if gdn_spec_recover_ring_in_page(num_spec):
+             # Record rings (u, k, g): fp32, activation dtype, fp32.
+             activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+             dtypes = (*dtypes, torch.float32, activation_dtype, torch.float32)
+@@ -318,7 +326,7 @@ class MambaStateShapeCalculator:
+             head_v_dim,
+             head_k_dim,
+         )
+-        if gdn_spec_recover_enabled(num_spec):
++        if gdn_spec_recover_ring_in_page(num_spec):
+             from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
+                 gdn_recover_ring_shapes,
+             )
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index 659e29fd5..a45055419 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -194,6 +194,7 @@ def _gdn_recover_verify_kernel(
+     R: tl.constexpr,
+     W: tl.constexpr,
+     FMT: tl.constexpr,
++    RECORDS_BY_ROW: tl.constexpr,
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+ ):
+     i_v, i_nh = tl.program_id(0), tl.program_id(1)
+@@ -232,9 +233,14 @@ def _gdn_recover_verify_kernel(
+     p_state = state + slot * stride_state_slot + i_hv * VP * K
+     b_h += gdn_spec_load_state(p_state, o_v, o_k, mask_v, mask_h, K, FMT)
+ 
+-    p_u = rec_u + slot * stride_u_slot + i_hv * R * V + o_v
+-    p_rk = rec_k + slot * stride_rk_slot + i_h * R * K + o_k
+-    p_g = rec_g + slot * stride_g_slot + i_hv * R
++    # Records of request n: in its slot's ring (W > 1, persistent), or in
++    # row n of a per-step buffer (W = 1: folded by this step's commit).
++    rec = slot
++    if RECORDS_BY_ROW:
++        rec = i_n.to(tl.int64)
++    p_u = rec_u + rec * stride_u_slot + i_hv * R * V + o_v
++    p_rk = rec_k + rec * stride_rk_slot + i_h * R * K + o_k
++    p_g = rec_g + rec * stride_g_slot + i_hv * R
+     pos0 = 0
+     if W > 1:
+         start = tl.load(ring_start + slot)
+@@ -297,16 +303,21 @@ def _gdn_recover_verify_kernel(
+ 
+ @dataclass
+ class GDNRecoverRecords:
+-    """One GDN layer's record rings, viewed per Mamba slot.
++    """One GDN layer's record rings.
+ 
+-    u: [num_slots, HV, R, V] float32
+-    k: [num_slots, H, R, K] activation dtype (raw key, before l2norm)
+-    g: [num_slots, HV, R] float32
++    u: [n, HV, R, V] float32
++    k: [n, H, R, K] activation dtype (raw key, before l2norm)
++    g: [n, HV, R] float32
++
++    by_row=False: n = Mamba slots (rings in the Mamba page, W >= 1).
++    by_row=True: n = spec rows of a step (a per-layer buffer outside the KV
++    cache; W = 1 only, since every step folds its records).
+     """
+ 
+     u: torch.Tensor
+     k: torch.Tensor
+     g: torch.Tensor
++    by_row: bool = False
+ 
+     @property
+     def ring_len(self) -> int:
+@@ -324,14 +335,23 @@ class GDNRecoverRecords:
+         dtype: torch.dtype,
+         device: torch.device | str,
+         window: int = 1,
++        by_row: bool = False,
+     ) -> "GDNRecoverRecords":
++        """`num_slots` slots (or, with by_row, spec rows: R = num_spec + 1)."""
++        assert not (by_row and window != 1), "row records need window 1"
+         u_shape, k_shape, g_shape = gdn_recover_ring_shapes(
+-            num_k_heads, num_v_heads, head_k_dim, head_v_dim, num_spec, window
++            num_k_heads,
++            num_v_heads,
++            head_k_dim,
++            head_v_dim,
++            num_spec,
++            0 if by_row else window,
+         )
+         return cls(
+             torch.zeros((num_slots, *u_shape), dtype=torch.float32, device=device),
+             torch.zeros((num_slots, *k_shape), dtype=dtype, device=device),
+             torch.zeros((num_slots, *g_shape), dtype=torch.float32, device=device),
++            by_row=by_row,
+         )
+ 
+ 
+@@ -412,6 +432,8 @@ def gdn_recover_verify(
+             raise ValueError(f"GDN recover verify: {name} records must be contiguous")
+     if window > 1 and trackers is None:
+         raise ValueError("GDN recover verify: window > 1 needs ring trackers")
++    if records.by_row and (window != 1 or cu_seqlens.shape[0] - 1 > records.u.shape[0]):
++        raise ValueError("GDN recover verify: row records need W = 1 and a row each")
+     if out is None:
+         out = torch.empty((T, HV, V), dtype=q.dtype, device=q.device)
+     elif out.dim() == 4:
+@@ -471,6 +493,7 @@ def gdn_recover_verify(
+         R=R,
+         W=window,
+         FMT=GDN_STATE_FORMATS[fmt],
++        RECORDS_BY_ROW=records.by_row,
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+         num_warps=_NUM_WARPS,
+         num_stages=_NUM_STAGES,
+@@ -615,6 +638,7 @@ def _gdn_recover_commit_kernel(
+     BV: tl.constexpr,
+     R: tl.constexpr,
+     FMT: tl.constexpr,
++    RECORDS_BY_ROW: tl.constexpr,
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+ ):
+     """Fold planned records into the checkpoint, all layers of a group at once."""
+@@ -652,9 +676,12 @@ def _gdn_recover_commit_kernel(
+         K,
+         FMT,
+     )
+-    p_u = rec_u + src * stride_u_slot + i_hv * R * V + o_v
+-    p_rk = rec_k + src * stride_rk_slot + i_h * R * K + o_k
+-    p_g = rec_g + src * stride_g_slot + i_hv * R
++    rec = src
++    if RECORDS_BY_ROW:
++        rec = i_n.to(tl.int64)
++    p_u = rec_u + rec * stride_u_slot + i_hv * R * V + o_v
++    p_rk = rec_k + rec * stride_rk_slot + i_h * R * K + o_k
++    p_g = rec_g + rec * stride_g_slot + i_hv * R
+     for j in range(0, count):
+         pos = (start + j) % R
+         b_h = _gdn_replay_record(
+@@ -720,6 +747,8 @@ class GDNRecoverCommitGroup:
+                     raise ValueError("GDN recover commit: layer record strides differ")
+         if window > 1 and trackers is None:
+             raise ValueError("GDN recover commit: window > 1 needs ring trackers")
++        if any(r.by_row != r0.by_row for r in records) or (r0.by_row and window != 1):
++            raise ValueError("GDN recover commit: inconsistent row records")
+         self.states = states
+         self.records = records
+         self.HV, VP, self.K = s0.shape[1:]
+@@ -837,6 +866,7 @@ class GDNRecoverCommitGroup:
+             BV=BV,
+             R=r0.ring_len,
+             FMT=GDN_STATE_FORMATS[self.fmt],
++            RECORDS_BY_ROW=r0.by_row,
+             USE_QK_L2NORM_IN_KERNEL=self.use_qk_l2norm_in_kernel,
+             num_warps=_NUM_WARPS,
+             num_stages=_NUM_STAGES,
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 6db945aef..c41949c2d 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -946,7 +946,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 ), "GDN recover layers of a group must share ring trackers"
+             self._recover_group = GDNRecoverCommitGroup(
+                 states=[layer.kv_cache[1] for layer in layers],
+-                records=[GDNRecoverRecords(*layer.kv_cache[2:5]) for layer in layers],
++                records=[
++                    layer._recover_records
++                    if getattr(layer, "_recover_records", None) is not None
++                    else GDNRecoverRecords(*layer.kv_cache[2:5])
++                    for layer in layers
++                ],
+                 num_k_heads=layers[0].num_k_heads // layers[0].tp_size,
+                 window=window,
+                 trackers=trackers,

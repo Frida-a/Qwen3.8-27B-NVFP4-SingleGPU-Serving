@@ -1,0 +1,77 @@
+{
+  "key": "('fp4_gemm', 'CutlassFp4GemmRunner', ((1536, 2560), (2560, 14336), (-1, 320), (320, 14336), (), (0,), (-1, 14336), (0,), (0,), (-1,)), ())",
+  "key_fields": {
+    "__tuple__": [
+      "fp4_gemm",
+      "CutlassFp4GemmRunner",
+      {
+        "__tuple__": [
+          {
+            "__tuple__": [
+              1536,
+              2560
+            ]
+          },
+          {
+            "__tuple__": [
+              2560,
+              14336
+            ]
+          },
+          {
+            "__tuple__": [
+              -1,
+              320
+            ]
+          },
+          {
+            "__tuple__": [
+              320,
+              14336
+            ]
+          },
+          {
+            "__tuple__": []
+          },
+          {
+            "__tuple__": [
+              0
+            ]
+          },
+          {
+            "__tuple__": [
+              -1,
+              14336
+            ]
+          },
+          {
+            "__tuple__": [
+              0
+            ]
+          },
+          {
+            "__tuple__": [
+              0
+            ]
+          },
+          {
+            "__tuple__": [
+              -1
+            ]
+          }
+        ]
+      },
+      {
+        "__tuple__": []
+      }
+    ]
+  },
+  "profiling_policy": [
+    "cuda_graph_profile_replays",
+    1,
+    "l2_cache_policy",
+    "cold"
+  ],
+  "runner": "CutlassFp4GemmRunner",
+  "tactic": 25
+}

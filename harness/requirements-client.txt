@@ -1,0 +1,24 @@
+# Client-side Python packages for harness/perf and harness/accuracy/tools (not the server: the server is the docker
+# image built by harness/serve/build_image.sh). Python >= 3.11 (aiperf 0.13.0 needs it; measured with 3.12).
+#
+# Versions are the ones in the measurement venvs. The AIPerf venv (aiperf 0.13.0 + the AIPerf-pulled packages below)
+# drove sweep_aiperf.sh / mixload.sh; the OpenAI client version is the one in the NeMo Gym v0.7.0 venv. NeMo Gym itself
+# is pinned by its own lockfile (`uv sync --frozen` in a v0.7.0 checkout; harness/README.md, section 3).
+#
+#   uv venv --python 3.12 .venv-client && . .venv-client/bin/activate && uv pip install -r harness/requirements-client.txt
+aiperf==0.13.0
+transformers==5.22.2
+huggingface_hub==1.33.0     # provides the `hf` CLI used in the READMEs
+openai==2.44.0              # sd_bench.py, gate20.py, replay_agentic.py
+pandas==2.3.3               # replay_agentic.py (OpenHands parquet), build_prompt_sets.py
+pyarrow==26.0.1
+numpy==2.5.4
+aiohttp==3.14.5             # harness/accuracy/tools/lb.py
+tiktoken==0.14.0
+datasets==5.2.0             # recipes/tools/build_mmmu_pro_full.py (decontamination input; measured with the Gym venv's datasets 4.4.1)
+pyyaml                      # harness/accuracy/tools/repeat_overrides.py (also present in the Gym venv)
+
+# harness/perf/build_prompt_sets.py loads `livecodebench/code_generation_lite` through its dataset loading script
+# (trust_remote_code), which datasets >= 4 no longer runs. Build the prompt sets in a separate small venv:
+#   python3 -m venv .venv-prompts && .venv-prompts/bin/pip install "datasets>=3.6,<4" pandas pyarrow
+#   .venv-prompts/bin/python harness/perf/build_prompt_sets.py --out data/prompt_sets.json --gpqa-jsonl <gpqa export>

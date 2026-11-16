@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:46:38 -0800
+Subject: [PATCH] [QW38] KV grouping v2: group size by per-request slot-block
+ cost (max_memory_usage per bucket)
+
+v1 (gs 5->16) lowered the reported L2 KV (971,671 -> 901,616 tokens) because
+the 5-layer SWA bucket's worst-case admission (~44 blocks/request) was padded
+to 16 slots. Cost = sum_b cdiv(n_b,gs)*gs*blocks_per_request_b; fewest groups
+within VLLM_KV_GROUP_TOL (0.10) of the min; applied only if >=1% better than
+the heuristic. L2: 5 -> 8 (1960 -> 1760 slot-blocks). VLLM_KV_GROUP_SIZE forces.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/core/kv_cache_planning.py | 88 ++++++++++++++++++-------------
+ 1 file changed, 51 insertions(+), 37 deletions(-)
+
+diff --git a/vllm/v1/core/kv_cache_planning.py b/vllm/v1/core/kv_cache_planning.py
+index d5f67ccca..4e2c34c3c 100644
+--- a/vllm/v1/core/kv_cache_planning.py
++++ b/vllm/v1/core/kv_cache_planning.py
+@@ -442,6 +442,7 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
+ 
+ def _get_kv_cache_groups_uniform_page_size(
+     kv_cache_spec: dict[str, KVCacheSpec],
++    vllm_config: "VllmConfig | None" = None,
+ ) -> list[KVCacheGroupSpec]:
+     """Generates the KV cache groups for hybrid models with multiple
+     attention types but still with a uniform page size (physical memory per
+@@ -557,8 +558,8 @@ def _get_kv_cache_groups_uniform_page_size(
+         # layers while accommodating speculative decoding drafters that add
+         # extra layers to one attention type.
+         group_size = max_num_layers
+-    group_size = _min_full_attention_padding_group_size(
+-        layer_buckets, spec_buckets, group_size
++    group_size = _min_padding_cost_group_size(
++        layer_buckets, spec_buckets, group_size, vllm_config
+     )
+     grouped_layers = []
+     for layers in layer_buckets:
+@@ -586,52 +587,65 @@ def _get_kv_cache_groups_uniform_page_size(
+     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+ 
+ 
+-def _min_full_attention_padding_group_size(
++def _min_padding_cost_group_size(
+     layer_buckets: list[list[str]],
+     spec_buckets: list[list[KVCacheSpec]],
+     group_size: int,
++    vllm_config: "VllmConfig | None",
+ ) -> int:
+-    """QW38: pick a group size that does not pad full-attention buckets.
++    """QW38: choose the group size by the per-request block cost of padding.
+ 
+     Every block of the shared pool spans `group_size` layer slots, so a padded
+-    slot in a group is wasted for every block that group allocates. For a
+-    full-attention group that is every block of every request (length
+-    proportional), while sliding-window / chunked-local / mamba groups hold a
+-    bounded number of blocks per request. The n:1 heuristic above picks the
+-    smallest bucket as the group size; with a speculative drafter that adds a
+-    small bucket of a different type (e.g. Qwen3.8 hybrid: 16 full + 48 mamba,
+-    plus a DFlash2 draft with 5 sliding-window layers -> group size 5) the 16
+-    full-attention layers are padded to 20 slots and each request walks 4 full
+-    groups: -20% KV tokens. If the heuristic's choice pads a full-attention
+-    bucket, use the group size with (least full-attention padding, fewest
+-    groups, least total padding) instead; otherwise keep it unchanged.
+-    Off-switch: VLLM_KV_GROUP_FULL_PAD_FIX=0.
++    slot is wasted for every block its group allocates. A request at
++    max_model_len holds `cdiv(max_memory_usage, page)` blocks per group of a
++    bucket (full attention: max_model_len / block_size; sliding window:
++    window + scheduling chunk; mamba: a few), so the pool slot-blocks one
++    request costs are sum_b cdiv(n_b, gs) * gs * blocks_per_request_b, and the
++    KV capacity is inversely proportional to it. The n:1 heuristic above picks
++    the smallest bucket; a DFlash2 draft (5 sliding-window layers) on the
++    Qwen3.8 hybrid trunk (16 full + 48 mamba) then gets group size 5: the 16
++    full layers pad to 20 slots in 4 groups (-19% KV tokens). Pick the size
++    with the fewest groups among those within VLLM_KV_GROUP_TOL (default 0.10)
++    of the minimal cost, and use it only if it beats the heuristic's cost by
++    >= 1%; otherwise keep the heuristic (all existing configs unchanged).
++    VLLM_KV_GROUP_SIZE=<n> forces a size (A/B); VLLM_KV_GROUP_FULL_PAD_FIX=0
++    disables the change.
+     """
+-    if os.environ.get("VLLM_KV_GROUP_FULL_PAD_FIX", "1") == "0":
++    if os.environ.get("VLLM_KV_GROUP_FULL_PAD_FIX", "1") == "0" or vllm_config is None:
+         return group_size
+     sizes = [len(layers) for layers in layer_buckets]
+-    is_full = [
+-        isinstance(specs[0], FullAttentionSpec) for specs in spec_buckets
+-    ]
++    forced = os.environ.get("VLLM_KV_GROUP_SIZE")
++    if forced:
++        logger.info("KV cache grouping: group size forced %d -> %s (bucket sizes %s)",
++                    group_size, forced, sizes)
++        return int(forced)
++    try:
++        bpr = [
++            max(cdiv(sp.max_memory_usage_bytes(vllm_config), sp.page_size_bytes)
++                for sp in specs)
++            for specs in spec_buckets
++        ]
++    except Exception as e:  # unknown spec type: keep the heuristic
++        logger.warning("KV cache grouping: cost model unavailable (%s)", e)
++        return group_size
+ 
+-    def cost(gs: int) -> tuple[int, int, int]:
+-        full_pad = sum(
+-            cdiv(n, gs) * gs - n for n, f in zip(sizes, is_full) if f
+-        )
+-        n_groups = sum(cdiv(n, gs) for n in sizes)
+-        total_pad = sum(cdiv(n, gs) * gs - n for n in sizes)
+-        return full_pad, n_groups, total_pad
++    def cost(gs: int) -> int:
++        return sum(cdiv(n, gs) * gs * b for n, b in zip(sizes, bpr))
+ 
+-    base = cost(group_size)
+-    if base[0] == 0:
+-        return group_size
+-    best = min(range(1, max(sizes) + 1), key=lambda gs: (*cost(gs), -gs))
+-    if cost(best)[0] < base[0]:
++    def n_groups(gs: int) -> int:
++        return sum(cdiv(n, gs) for n in sizes)
++
++    cands = range(1, max(sizes) + 1)
++    c_min = min(cost(gs) for gs in cands)
++    tol = float(os.environ.get("VLLM_KV_GROUP_TOL", "0.10"))
++    best = min((gs for gs in cands if cost(gs) <= c_min * (1 + tol)),
++               key=lambda gs: (n_groups(gs), cost(gs), -gs))
++    if cost(best) <= 0.99 * cost(group_size):
+         logger.info(
+-            "KV cache grouping: group size %d -> %d (full-attention padding "
+-            "%d -> %d layer slots; groups %d -> %d; bucket sizes %s)",
+-            group_size, best, base[0], cost(best)[0], base[1],
+-            cost(best)[1], sizes,
++            "KV cache grouping: group size %d -> %d (per-request slot-blocks "
++            "%d -> %d, min %d; groups %d -> %d; bucket sizes %s, blocks/request %s)",
++            group_size, best, cost(group_size), cost(best), c_min,
++            n_groups(group_size), n_groups(best), sizes, bpr,
+         )
+         return best
+     return group_size
+@@ -1252,7 +1266,7 @@ def get_kv_cache_groups(
+         if fallback_groups is None:
+             raise
+         return fallback_groups
+-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
++    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)
+ 
+     # Add hidden-state layers back with page aligned to the common page.
+     if hidden_specs:

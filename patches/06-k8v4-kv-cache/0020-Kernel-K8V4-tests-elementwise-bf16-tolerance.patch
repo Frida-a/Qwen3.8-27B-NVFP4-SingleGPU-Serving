@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:42:46 -0800
+Subject: [PATCH] [Kernel] K8V4 tests: elementwise bf16 tolerance
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/attention/test_k8v4_kv.py | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/tests/kernels/attention/test_k8v4_kv.py b/tests/kernels/attention/test_k8v4_kv.py
+index 41a2c0494..d4af8fcfc 100644
+--- a/tests/kernels/attention/test_k8v4_kv.py
++++ b/tests/kernels/attention/test_k8v4_kv.py
+@@ -127,9 +127,11 @@ def _setup_decode(seq_lens_list, q_lens_list, page, seed=1):
+ 
+ 
+ def _check(out, ref):
+-    err = (out.float() - ref).abs().max().item()
++    # bf16 output rounding: elementwise atol + rtol (2 bf16 ulps), plus rel-L2
++    diff = (out.float() - ref).abs()
++    bad = diff > 2e-2 + 1.6e-2 * ref.abs()
+     rel = ((out.float() - ref).norm() / ref.norm().clamp_min(1e-6)).item()
+-    assert err < 3e-2 and rel < 6e-3, (err, rel)
++    assert not bad.any() and rel < 6e-3, (diff.max().item(), int(bad.sum()), rel)
+ 
+ 
+ @pytest.mark.parametrize("page", [16, 64])
+@@ -186,8 +188,7 @@ def test_decode_matches_emulated_bf16_cache():
+     mask = torch.arange(3000, device=DEV)[None] <= (3000 - 4 + torch.arange(4, device=DEV))[:, None]
+     ref = torch.nn.functional.scaled_dot_product_attention(
+         qq, kk, vv, attn_mask=mask, scale=scale).transpose(0, 1)
+-    err = (out.float() - ref.float()).abs().max().item()
+-    assert err < 3e-2, err
++    _check(out, ref.float())
+ 
+ 
+ def test_decode_cuda_graph_replay():

@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 13:43:12 -0800
+Subject: [PATCH] [QW38] gdn recover commit: alignment hint on address-table
+ pointers (D2)
+
+The commit kernel builds its per-layer state/record pointers from int64
+address tables, so Triton had no alignment info: no vectorization, a
+[1,32]-per-row layout and 255 registers (16% occupancy, ncu A').
+tl.multiple_of(ptr, 16) gives the same vectorized layout as the verify
+([1,8]x[2,16]x[4,1]): 96 registers (offline sm_120 ptxas). Host check
+that every table tensor is 16-B aligned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/mamba/ops/gdn_recover_spec.py      | 23 +++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index 31ae7de01..1daf9f1c2 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -697,10 +697,22 @@ def _gdn_recover_commit_kernel(
+     b_slot = tl.load(p_plan + 4).to(tl.int64)
+     b_count = tl.load(p_plan + 5)
+ 
+-    state = tl.load(state_addrs + i_l).to(tl.pointer_type(state_ref.dtype.element_ty))
+-    rec_u = tl.load(u_addrs + i_l).to(tl.pointer_type(u_ref.dtype.element_ty))
+-    rec_k = tl.load(rk_addrs + i_l).to(tl.pointer_type(rk_ref.dtype.element_ty))
+-    rec_g = tl.load(g_addrs + i_l).to(tl.pointer_type(g_ref.dtype.element_ty))
++    # The address tables hold torch allocations (>= 256 B aligned); without
++    # the hint Triton cannot vectorize, picks a [1, 32]-per-row layout and
++    # needs ~255 registers (16% occupancy).
++    state = tl.multiple_of(
++        tl.load(state_addrs + i_l).to(tl.pointer_type(state_ref.dtype.element_ty)), 16
++    )
++    rec_u = tl.multiple_of(
++        tl.load(u_addrs + i_l).to(tl.pointer_type(u_ref.dtype.element_ty)), 16
++    )
++    rec_k = tl.multiple_of(
++        tl.load(rk_addrs + i_l).to(tl.pointer_type(rk_ref.dtype.element_ty)), 16
++    )
++    rec_g = tl.multiple_of(
++        tl.load(g_addrs + i_l).to(tl.pointer_type(g_ref.dtype.element_ty)), 16
++    )
++
+ 
+     o_k = tl.arange(0, BK)
+     o_v = i_v * BV + tl.arange(0, BV)
+@@ -809,6 +821,9 @@ class GDNRecoverCommitGroup:
+         device = s0.device
+ 
+         def addrs(ts: list[torch.Tensor]) -> torch.Tensor:
++            # The commit kernel declares these base pointers 16-byte aligned.
++            if any(t.data_ptr() % 16 for t in ts):
++                raise ValueError("GDN recover commit: tensors must be 16-B aligned")
+             return torch.tensor([t.data_ptr() for t in ts], dtype=torch.int64).to(
+                 device
+             )

@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:35:57 -0800
+Subject: [PATCH] [Bugfix] Qwen3.5 MTP (nvidia models/): same per-layer quant
+ fix for the mtp.* block
+
+The speculator loads vllm/models/qwen3_5/nvidia/mtp.py, not
+model_executor/models/qwen3_5_mtp.py; apply the same unmapped-config rebuild.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Frida Hou <Frida-a@users.noreply.github.com>
+---
+ vllm/models/qwen3_5/nvidia/mtp.py | 51 +++++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/qwen3_5/nvidia/mtp.py b/vllm/models/qwen3_5/nvidia/mtp.py
+index dfdee2d90..01c5b3e6c 100644
+--- a/vllm/models/qwen3_5/nvidia/mtp.py
++++ b/vllm/models/qwen3_5/nvidia/mtp.py
+@@ -200,9 +200,23 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+ 
+         super().__init__()
+         self.config = config
+-        self.model = Qwen3_5MultiTokenPredictor(
+-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
+-        )
++        # The MTP block is built with a quant config whose per-layer entries still
++        # name its `mtp.*` layers (see _mtp_quant_config); everything else keeps the
++        # shared one.
++        shared_quant_config = vllm_config.quant_config
++        vllm_config.quant_config = self._mtp_quant_config(vllm_config)
++        try:
++            self.model = Qwen3_5MultiTokenPredictor(
++                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
++            )
++        finally:
++            vllm_config.quant_config = shared_quant_config
++        for name, module in self.model.named_modules():
++            quant_method = getattr(module, "quant_method", None)
++            if quant_method is not None and name.startswith("layers."):
++                logger.info_once(
++                    "MTP layer mtp.%s: %s", name, type(quant_method).__name__
++                )
+ 
+         if get_pp_group().is_last_rank:
+             self.lm_head = ParallelLMHead(
+@@ -282,6 +296,37 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+         # One lm_head is shared by all MTP modules, as in compute_logits.
+         return super().get_top_tokens(hidden_states)
+ 
++    @classmethod
++    def _mtp_quant_config(cls, vllm_config: VllmConfig):
++        """The quant config to build the MTP block with.
++
++        The target model's `hf_to_vllm_mapper` drops the `mtp.` prefix (those
++        weights belong to this drafter), and a per-layer quant config (ModelOpt
++        MIXED_PRECISION `quantized_layers`) that was remapped with it has lost
++        every `mtp.*` entry, so a quantized MTP head would be built unquantized.
++        Rebuild the config from the checkpoint, unmapped, when that happened.
++        """
++        quant_config = vllm_config.quant_config
++        layers = getattr(quant_config, "quantized_layers", None)
++        if quant_config is None or layers is None:
++            return quant_config
++        if any(k.startswith("mtp.") for k in layers):
++            return quant_config
++        fresh = VllmConfig.get_quantization_config(
++            vllm_config.model_config, vllm_config.load_config
++        )
++        fresh_layers = getattr(fresh, "quantized_layers", None) or {}
++        if not any(k.startswith("mtp.") for k in fresh_layers):
++            return quant_config
++        fresh.packed_modules_mapping = dict(cls.packed_modules_mapping)
++        logger.info(
++            "MTP: building the MTP block with an unmapped %s config "
++            "(%d mtp.* quantized layers)",
++            fresh.get_name(),
++            sum(k.startswith("mtp.") for k in fresh_layers),
++        )
++        return fresh
++
+     def is_unused_checkpoint_weight(self, name: str) -> bool:
+         return not name.startswith("mtp.") and not any(
+             key in name for key in ["embed_tokens", "lm_head"]

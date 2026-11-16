@@ -1,0 +1,474 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:10:55 -0800
+Subject: [PATCH] [GDN] recover spec: int16 row-scaled state (FMT=int16_row)
+
+VLLM_GDN_SPEC_STATE=recover now works with --mamba-ssm-cache-dtype int16. The
+verify and commit kernels load/store the checkpoint through the int16
+row-scale codec (gdn_int16_load_state / gdn_int16_store_state, the same
+functions the per-token path uses), dispatched on the constexpr FMT; the
+format follows the state dtype and VP = V + scale rows (130 for V=K=128).
+
+With W = 1 the commit re-quantizes once per step from the same fp32 state the
+per-token path quantizes into its accepted column, so outputs and the stored
+int16 codes/scales are bit-identical to per_token (int16). W > 1 re-quantizes
+only on fold (logged; not bit-identical).
+
+Tests: tests/kernels/mamba/test_gdn_recover_int16.py (4 steps, row and slot
+records, align boundary; outputs and int16 state bitwise vs the per-token
+Triton path), model-path test int16 variant.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/mamba/test_gdn_recover_int16.py | 175 ++++++++++++++++++
+ .../mamba/test_gdn_recover_model_path.py      |  21 ++-
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  |   9 +-
+ .../layers/mamba/ops/gdn_recover_spec.py      |  75 ++++++--
+ 4 files changed, 257 insertions(+), 23 deletions(-)
+ create mode 100644 tests/kernels/mamba/test_gdn_recover_int16.py
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_int16.py b/tests/kernels/mamba/test_gdn_recover_int16.py
+new file mode 100644
+index 000000000..00387cb51
+--- /dev/null
++++ b/tests/kernels/mamba/test_gdn_recover_int16.py
+@@ -0,0 +1,175 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""VLLM_GDN_SPEC_STATE=recover with the int16 row-scaled state
++(--mamba-ssm-cache-dtype int16): verify + commit through the int16 codec must
++reproduce the per-token Triton path (also int16) bit-exactly -- outputs and
++the stored int16 codes/scales of the accepted state -- step after step.
++
++W = 1 only: the per-token path re-quantizes the state every step, which the
++recover commit does too (W > 1 re-quantizes only on fold, so it differs).
++"""
++
++import os
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++    GDNRecoverCommitGroup,
++    GDNRecoverRecords,
++    gdn_recover_verify,
++)
++from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
++    gdn_int16_state_rows,
++    quantize_state_int16_ref,
++)
++from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
++    fused_sigmoid_gating_delta_rule_update,
++)
++
++INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
++DEV = "cpu" if INTERPRET else "cuda"
++if not INTERPRET and not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++K = V = 128
++H = 16 if not INTERPRET else 2
++HV = 48 if not INTERPRET else 6
++VP = gdn_int16_state_rows(V, K)
++
++
++def _bits(x):
++    return x.view({4: torch.int32, 2: torch.int16}[x.element_size()])
++
++
++def _same(got, ref, what):
++    assert got.shape == ref.shape and got.dtype == ref.dtype, what
++    if ref.is_floating_point():
++        assert torch.isfinite(ref.float()).all(), f"{what}: non-finite reference"
++    n_bad = int((_bits(got) != _bits(ref)).sum())
++    assert n_bad == 0, f"{what}: {n_bad}/{got.numel()} elements differ"
++
++
++def _inputs(qlens, gen):
++    T = sum(qlens)
++    conv_dim = 2 * H * K + HV * V
++    qkv = (torch.randn((T, conv_dim), generator=gen, device=DEV) * 0.5).to(
++        torch.bfloat16
++    )
++    qkv[:, 2 * H * K :] *= 4
++    ba = torch.randn((T, 2 * HV), generator=gen, device=DEV).to(torch.bfloat16)
++    cu = torch.zeros(len(qlens) + 1, dtype=torch.int32, device=DEV)
++    cu[1:] = torch.cumsum(torch.tensor(qlens, device=DEV), 0)
++    q = qkv[:, : H * K].view(T, H, K)
++    k = qkv[:, H * K : 2 * H * K].view(T, H, K)
++    v = qkv[:, 2 * H * K :].view(T, HV, V)
++    return q, k, v, ba[:, HV:], ba[:, :HV], cu
++
++
++@pytest.mark.parametrize("by_row", [True, False])
++@pytest.mark.parametrize("N,t_max", [(1, 4), (3, 4), (4, 8)])
++def test_int16_recover_matches_per_token(N, t_max, by_row):
++    if not INTERPRET and N == 1:
++        N = 32  # also a larger batch on GPU
++    steps = 4
++    gen = torch.Generator(device=DEV).manual_seed(N * 10 + t_max + by_row)
++    cpu_gen = torch.Generator().manual_seed(N + t_max)
++    A_log = torch.log(torch.rand(HV, generator=gen, device=DEV) * 15 + 1)
++    dt_bias = torch.randn(HV, generator=gen, device=DEV)
++    s0 = torch.randn((N, HV, V, K), generator=gen, device=DEV)
++    s0[:, :, ::7] *= 30.0  # heavy-tailed rows
++    init = quantize_state_int16_ref(s0)
++
++    # Per-token path: N x t_max slots per step; the accepted column feeds the
++    # next step (num_accepted_tokens), as in the model runner (mode "none").
++    pool = torch.zeros((1 + N * t_max, HV, VP, K), dtype=torch.int16, device=DEV)
++    idx = torch.arange(1, 1 + N * t_max, device=DEV, dtype=torch.int32).view(N, t_max)
++    pool[idx[:, 0].long()] = init
++    acc_prev = torch.ones(N, dtype=torch.int32, device=DEV)
++    # Recover: one slot per request.
++    state = torch.zeros((1 + N, HV, VP, K), dtype=torch.int16, device=DEV)
++    slots = torch.arange(1, N + 1, dtype=torch.int32, device=DEV)
++    state[1:] = init
++    rec = GDNRecoverRecords.allocate(
++        N if by_row else 1 + N, H, HV, K, V, t_max - 1, torch.bfloat16, DEV,
++        by_row=by_row,
++    )  # fmt: skip
++    group = GDNRecoverCommitGroup([state], [rec], num_k_heads=H)
++    assert group.fmt == "int16_row"
++
++    for s in range(steps):
++        qlens = torch.randint(1, t_max + 1, (N,), generator=cpu_gen).tolist()
++        q, k, v, a, b, cu = _inputs(qlens, gen)
++        o_ref, _ = fused_sigmoid_gating_delta_rule_update(
++            A_log=A_log, a=a.contiguous().unsqueeze(0), b=b.contiguous().unsqueeze(0),
++            dt_bias=dt_bias, q=q.contiguous().unsqueeze(0),
++            k=k.contiguous().unsqueeze(0), v=v.contiguous().unsqueeze(0),
++            initial_state=pool, inplace_final_state=True, cu_seqlens=cu,
++            ssm_state_indices=idx, num_accepted_tokens=acc_prev,
++            use_qk_l2norm_in_kernel=True,
++        )  # fmt: skip
++        out = torch.empty((sum(qlens), HV, V), dtype=torch.bfloat16, device=DEV)
++        gdn_recover_verify(
++            q, k, v, a, b, A_log, dt_bias, state, rec, cu, slots, out=out
++        )
++        _same(out, o_ref.squeeze(0), f"output step {s}")
++        acc = torch.tensor(
++            [int(torch.randint(1, ql + 1, (1,), generator=cpu_gen)) for ql in qlens],
++            dtype=torch.int32,
++            device=DEV,
++        )
++        group.commit(slots, cu, acc)
++        ref_state = pool[idx[torch.arange(N), acc.long() - 1].long()]
++        _same(state[1:], ref_state, f"int16 state step {s}")
++        acc_prev = acc
++
++
++def test_int16_align_boundary():
++    """Align mode: the boundary block gets the int16 encoding of the state at
++    the boundary, exactly as the per-token path's column."""
++    bs, t_max, cols, N = 8, 4, 4, 2
++    computed, acc = [5, 13], [4, 3]
++    gen = torch.Generator(device=DEV).manual_seed(5)
++    q, k, v, a, b, cu = _inputs([t_max] * N, gen)
++    A_log = torch.log(torch.rand(HV, generator=gen, device=DEV) * 15 + 1)
++    dt_bias = torch.randn(HV, generator=gen, device=DEV)
++    init = quantize_state_int16_ref(
++        torch.randn((N, HV, V, K), generator=gen, device=DEV)
++    )
++    pool = torch.zeros((1 + N * t_max, HV, VP, K), dtype=torch.int16, device=DEV)
++    idx = torch.arange(1, 1 + N * t_max, device=DEV, dtype=torch.int32).view(N, t_max)
++    pool[idx[:, 0].long()] = init
++    fused_sigmoid_gating_delta_rule_update(
++        A_log=A_log, a=a.contiguous().unsqueeze(0), b=b.contiguous().unsqueeze(0),
++        dt_bias=dt_bias, q=q.contiguous().unsqueeze(0), k=k.contiguous().unsqueeze(0),
++        v=v.contiguous().unsqueeze(0), initial_state=pool, inplace_final_state=True,
++        cu_seqlens=cu, ssm_state_indices=idx,
++        num_accepted_tokens=torch.ones(N, dtype=torch.int32, device=DEV),
++        use_qk_l2norm_in_kernel=True,
++    )  # fmt: skip
++    table = (1 + torch.arange(N * cols, dtype=torch.int32, device=DEV)).view(N, cols)
++    run_col = [(c + t_max - 1) // bs for c in computed]
++    slots = table[torch.arange(N), torch.tensor(run_col)].contiguous()
++    state = torch.zeros((1 + N * cols, HV, VP, K), dtype=torch.int16, device=DEV)
++    state[slots.long()] = init
++    rec = GDNRecoverRecords.allocate(
++        N, H, HV, K, V, t_max - 1, torch.bfloat16, DEV, by_row=True
++    )
++    gdn_recover_verify(q, k, v, a, b, A_log, dt_bias, state, rec, cu, slots)
++    GDNRecoverCommitGroup([state], [rec], num_k_heads=H).commit(
++        slots,
++        cu,
++        torch.tensor(acc, dtype=torch.int32, device=DEV),
++        block_table=table,
++        num_computed_tokens=torch.tensor(computed, dtype=torch.int32, device=DEV),
++        mamba_block_size=bs,
++    )
++    for n in range(N):
++        _same(state[slots[n]], pool[idx[n, acc[n] - 1]], f"final row {n}")
++        nb = (computed[n] // bs + 1) * bs
++        if nb - computed[n] <= acc[n] and nb // bs - 1 != run_col[n]:
++            _same(
++                state[table[n, nb // bs - 1]],
++                pool[idx[n, nb - computed[n] - 1]],
++                f"boundary row {n}",
++            )
+diff --git a/tests/kernels/mamba/test_gdn_recover_model_path.py b/tests/kernels/mamba/test_gdn_recover_model_path.py
+index 5d01e5c9b..d76ec0346 100644
+--- a/tests/kernels/mamba/test_gdn_recover_model_path.py
++++ b/tests/kernels/mamba/test_gdn_recover_model_path.py
+@@ -41,6 +41,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
+ from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (  # noqa: E402
+     GDNRecoverRecords,
+ )
++from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (  # noqa: E402
++    quantize_state_int16_ref,
++)
+ from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
+     GDNAttentionMetadataBuilder,
+     GDNRecoverSpecMetadata,
+@@ -102,13 +105,14 @@ class _Run:
+         num_slots = 1 + num_reqs * cols
+         table = 1 + torch.arange(num_reqs * cols, device=DEV, dtype=torch.int32)
+         self.table = table.view(num_reqs, cols)
++        int16 = init[1].dtype == torch.int16
+         shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+-            1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
++            1, H, HV, K, V, CONV_KERNEL, NUM_SPEC, int16_state=int16
+         )
+         # W = 1 keeps the page identical to per_token (records by row).
+         assert len(shapes) == (5 if recover and window > 1 else 2)
+         conv = torch.zeros(num_slots, *shapes[0], device=DEV, dtype=torch.bfloat16)
+-        ssm = torch.zeros(num_slots, *shapes[1], device=DEV)
++        ssm = torch.zeros(num_slots, *shapes[1], device=DEV, dtype=init[1].dtype)
+         conv[self.table[:, 0].long()], ssm[self.table[:, 0].long()] = init
+         kv_cache = (conv, ssm)
+         records = None
+@@ -199,7 +203,7 @@ class _Run:
+         return self.ssm[self.table[rows, self.prev_acc.long() - 1].long()].clone()
+ 
+ 
+-def _setup(num_reqs, seed):
++def _setup(num_reqs, seed, int16=False):
+     torch.manual_seed(seed)
+     shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+         1, H, HV, K, V, CONV_KERNEL, 0
+@@ -211,6 +215,9 @@ def _setup(num_reqs, seed):
+         0.05 * torch.randn(num_reqs, *conv_shape, device=DEV).to(torch.bfloat16),
+         0.05 * torch.randn(num_reqs, *shapes[1], device=DEV),
+     )
++    if int16:
++        # --mamba-ssm-cache-dtype int16: codes + fp32 row scales [HV, VP, K].
++        init = (init[0], quantize_state_int16_ref(init[1]))
+     params = (
+         torch.log(torch.rand(HV, device=DEV) * 15 + 1),
+         0.1 * torch.randn(HV, device=DEV),
+@@ -231,12 +238,14 @@ def _assert_same(a, b, what):
+     assert torch.equal(_bits(a), _bits(b)), what
+ 
+ 
+-@pytest.mark.parametrize("window", [1, 2, 4])
++@pytest.mark.parametrize(
++    "window,int16", [(1, False), (2, False), (4, False), (1, True)]
++)
+ @pytest.mark.parametrize("num_reqs", [1, 5])
+ @torch.inference_mode()
+-def test_recover_matches_per_token_path(monkeypatch, num_reqs, window):
++def test_recover_matches_per_token_path(monkeypatch, num_reqs, window, int16):
+     steps = 6
+-    init, params = _setup(num_reqs, seed=num_reqs)
++    init, params = _setup(num_reqs, seed=num_reqs, int16=int16)
+     gen = torch.Generator().manual_seed(num_reqs * 10 + window)
+     inputs = [_inputs(num_reqs * T) for _ in range(steps)]
+     accepted = torch.randint(1, T + 1, (steps, num_reqs), generator=gen).to(torch.int32)
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index d56d583c4..0111c0624 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -980,8 +980,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 "unsupported mamba_cache_mode "
+                 f"{vllm_config.cache_config.mamba_cache_mode!r}"
+             )
+-        if ssm_dtype != torch.float32:
+-            return f"only an fp32 SSM state is supported (got {ssm_dtype})"
++        if ssm_dtype not in (torch.float32, torch.int16):
++            return f"only an fp32 or int16 SSM state is supported (got {ssm_dtype})"
++        if ssm_dtype == torch.int16 and self.recover_window > 1:
++            logger.info_once(
++                "VLLM_GDN_SPEC_STATE_W > 1 with the int16 SSM state re-quantizes "
++                "only when records are folded (not bit-identical to per_token)."
++            )
+         if not current_platform.is_cuda():
+             return "only CUDA is supported"
+         if vllm_config.parallel_config.pipeline_parallel_size > 1:
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index a45055419..31ae7de01 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -33,6 +33,11 @@ from dataclasses import dataclass
+ 
+ import torch
+ 
++from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
++    gdn_int16_load_state,
++    gdn_int16_state_rows,
++    gdn_int16_store_state,
++)
+ from vllm.triton_utils import tl, triton
+ 
+ # State formats (constexpr FMT values).
+@@ -48,9 +53,10 @@ GDN_STATE_FORMATS = {
+     "int8_row": GDN_STATE_FMT_INT8_ROW,
+     "int8_had32": GDN_STATE_FMT_INT8_HAD32,
+ }
+-_IMPLEMENTED_FORMATS = ("fp32",)
++_IMPLEMENTED_FORMATS = ("fp32", "int16_row")
+ 
+ _FMT_FP32 = tl.constexpr(GDN_STATE_FMT_FP32)
++_FMT_INT16_ROW = tl.constexpr(GDN_STATE_FMT_INT16_ROW)
+ 
+ # Same tiling as fused_sigmoid_gating_delta_rule_update: the identical layout
+ # keeps every reduction in the same order, which bit-exactness relies on.
+@@ -64,9 +70,20 @@ def gdn_state_padded_rows(fmt: str, head_v_dim: int, head_k_dim: int) -> int:
+         raise ValueError(f"unknown GDN state format {fmt!r}")
+     if fmt not in _IMPLEMENTED_FORMATS:
+         raise NotImplementedError(f"GDN spec state format {fmt!r} is not implemented")
++    if fmt == "int16_row":
++        return gdn_int16_state_rows(head_v_dim, head_k_dim)
+     return head_v_dim
+ 
+ 
++def gdn_state_format(state: torch.Tensor) -> str:
++    """State format from the cache dtype (fp32 or int16 row-scaled)."""
++    if state.dtype == torch.float32:
++        return "fp32"
++    if state.dtype == torch.int16:
++        return "int16_row"
++    raise NotImplementedError(f"GDN recover spec: unsupported state {state.dtype}")
++
++
+ def gdn_recover_ring_len(num_spec: int, window: int = 1) -> int:
+     """Ring rows R per head: W - 1 pending + (num_spec + 1) verified, + 1."""
+     return window + num_spec + 1
+@@ -96,23 +113,46 @@ def gdn_recover_ring_shapes(
+ 
+ @triton.jit
+ def gdn_spec_load_state(
+-    p_head, o_v, o_k, mask_v, mask_h, K: tl.constexpr, FMT: tl.constexpr
++    p_head,
++    o_v,
++    o_k,
++    mask_v,
++    mask_h,
++    V: tl.constexpr,
++    K: tl.constexpr,
++    FMT: tl.constexpr,
+ ):
+     """Load rows `o_v` of one head's stored block [VP, K] as fp32 [BV, BK]."""
+-    tl.static_assert(FMT == _FMT_FP32, "GDN spec state format not implemented")
+-    return tl.load(p_head + o_v[:, None] * K + o_k[None, :], mask=mask_h, other=0).to(
+-        tl.float32
+-    )
++    if FMT == _FMT_INT16_ROW:
++        b_h = gdn_int16_load_state(p_head, o_v, o_k, mask_v, mask_h, V, K)
++    else:
++        tl.static_assert(FMT == _FMT_FP32, "GDN spec state format not implemented")
++        b_h = tl.load(
++            p_head + o_v[:, None] * K + o_k[None, :], mask=mask_h, other=0
++        ).to(tl.float32)
++    return b_h
+ 
+ 
+ @triton.jit
+ def gdn_spec_store_state(
+-    p_head, b_h, o_v, o_k, mask_v, mask_h, K: tl.constexpr, FMT: tl.constexpr
++    p_head,
++    b_h,
++    o_v,
++    o_k,
++    mask_v,
++    mask_h,
++    V: tl.constexpr,
++    K: tl.constexpr,
++    FMT: tl.constexpr,
+ ):
+     """Encode fp32 rows [BV, BK] into one head's stored block [VP, K]."""
+-    tl.static_assert(FMT == _FMT_FP32, "GDN spec state format not implemented")
+-    p = p_head + o_v[:, None] * K + o_k[None, :]
+-    tl.store(p, b_h.to(p.dtype.element_ty), mask=mask_h)
++    if FMT == _FMT_INT16_ROW:
++        # Same quantizer as the per-token path's store (one scale per row).
++        gdn_int16_store_state(p_head, b_h, o_v, o_k, mask_v, mask_h, V, K)
++    else:
++        tl.static_assert(FMT == _FMT_FP32, "GDN spec state format not implemented")
++        p = p_head + o_v[:, None] * K + o_k[None, :]
++        tl.store(p, b_h.to(p.dtype.element_ty), mask=mask_h)
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -231,7 +271,7 @@ def _gdn_recover_verify_kernel(
+ 
+     b_h = tl.zeros([BV, BK], dtype=tl.float32)
+     p_state = state + slot * stride_state_slot + i_hv * VP * K
+-    b_h += gdn_spec_load_state(p_state, o_v, o_k, mask_v, mask_h, K, FMT)
++    b_h += gdn_spec_load_state(p_state, o_v, o_k, mask_v, mask_h, V, K, FMT)
+ 
+     # Records of request n: in its slot's ring (W > 1, persistent), or in
+     # row n of a per-step buffer (W = 1: folded by this step's commit).
+@@ -397,7 +437,7 @@ def gdn_recover_verify(
+     scale: float | None = None,
+     window: int = 1,
+     trackers: GDNRecoverTrackers | None = None,
+-    fmt: str = "fp32",
++    fmt: str | None = None,
+     softplus_beta: float = 1.0,
+     softplus_threshold: float = 20.0,
+     use_qk_l2norm_in_kernel: bool = True,
+@@ -417,6 +457,8 @@ def gdn_recover_verify(
+         a, b = a.squeeze(0), b.squeeze(0)
+     T, H, K = k.shape
+     HV, V = v.shape[1], v.shape[2]
++    if fmt is None:
++        fmt = gdn_state_format(state)
+     VP = gdn_state_padded_rows(fmt, V, K)
+     for name, x in (("q", q), ("k", k), ("v", v)):
+         _check_head_contiguous(name, x)
+@@ -673,6 +715,7 @@ def _gdn_recover_commit_kernel(
+         o_k,
+         mask_v,
+         mask_h,
++        V,
+         K,
+         FMT,
+     )
+@@ -701,6 +744,7 @@ def _gdn_recover_commit_kernel(
+                 o_k,
+                 mask_v,
+                 mask_h,
++                V,
+                 K,
+                 FMT,
+             )
+@@ -711,6 +755,7 @@ def _gdn_recover_commit_kernel(
+         o_k,
+         mask_v,
+         mask_h,
++        V,
+         K,
+         FMT,
+     )
+@@ -725,7 +770,7 @@ class GDNRecoverCommitGroup:
+         states: list[torch.Tensor],
+         records: list[GDNRecoverRecords],
+         num_k_heads: int,
+-        fmt: str = "fp32",
++        fmt: str | None = None,
+         window: int = 1,
+         trackers: GDNRecoverTrackers | None = None,
+         use_qk_l2norm_in_kernel: bool = True,
+@@ -754,8 +799,8 @@ class GDNRecoverCommitGroup:
+         self.HV, VP, self.K = s0.shape[1:]
+         self.V = r0.u.shape[-1]
+         self.H = num_k_heads
+-        self.fmt = fmt
+-        if VP != gdn_state_padded_rows(fmt, self.V, self.K):
++        self.fmt = fmt if fmt is not None else gdn_state_format(s0)
++        if VP != gdn_state_padded_rows(self.fmt, self.V, self.K):
+             raise ValueError("GDN recover commit: state rows do not match format")
+         self.VP = VP
+         self.window = window

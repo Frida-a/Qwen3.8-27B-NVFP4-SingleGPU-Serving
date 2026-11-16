@@ -1,0 +1,46 @@
+# MRCR (openai/mrcr), Qwen3.8 tokenizer: conversations > 131072 and <= 196608 content tokens (the 128K-196K band that
+# mrcr_qwen38_128k excludes), then filtered to a Qwen chat-templated prompt <= 196096 tokens (196608 - 512) so that
+# prompt + 64K output fits max_model_len 262144: 155 -> 139 rows (2/4/8 needles: 52/43/44), templated
+# 135,741..195,665 tokens (mean 166,721). Serve with MAXLEN=262144, output cap 64K as for mrcr_qwen38_128k.
+# Same data + grading as Gym's benchmarks/mrcr (SequenceMatcher ratio, gated on the random prefix);
+# data built on a CPU host with network access (repo root) with:
+#   export HF_HOME=<hf cache>
+#   PYTHONPATH=<extra deps dir> Gym/.venv/bin/python Gym/benchmarks/mrcr/prepare.py \
+#     --tokenizer_name <tokenizer dir, e.g. nvidia/Qwen3.8-27B-NVFP4> --max_context_tokens 196608 \
+#     --output_fpath <build dir>/mrcr_le196k.jsonl
+#   python3 -c 'import json,sys; [sys.stdout.write(l) for l in open("<build dir>/mrcr_le196k.jsonl") if json.loads(l)["n_tokens"] > 131072]' \
+#     > <build dir>/mrcr_gt128k_le196k.jsonl                                        # 155 rows
+#   PYTHONPATH=<extra deps dir> Gym/.venv/bin/python harness/accuracy/tools/mrcr_template_filter.py \
+#     <build dir>/mrcr_gt128k_le196k.jsonl \
+#     harness/accuracy/benchmarks/mrcr_qwen38_196k_gt128k/data/mrcr_qwen38_196k_gt128k_benchmark.jsonl \
+#     --tokenizer <tokenizer dir> --max-templated 196096                               # 139 rows
+# The filter reproduces the measured 139-row file byte for byte (checked with the nvidia/Qwen3.8-27B-NVFP4 tokenizer).
+# jsonl_fpath is repo-relative; run_gym.sh makes it absolute in the run copy it generates.
+config_paths:
+  - resources_servers/mrcr/configs/mrcr.yaml
+
+mrcr_qwen38_196k_gt128k_benchmark_resources_server:
+  _inherit_from: mrcr_resources_server
+
+mrcr_qwen38_196k_gt128k_benchmark_simple_agent:
+  _inherit_from: mrcr_simple_agent
+  responses_api_agents:
+    simple_agent:
+      max_steps: 1
+      resources_server:
+        name: mrcr_qwen38_196k_gt128k_benchmark_resources_server
+      datasets:
+      - name: mrcr_qwen38_196k_gt128k
+        type: benchmark
+        jsonl_fpath: harness/accuracy/benchmarks/mrcr_qwen38_196k_gt128k/data/mrcr_qwen38_196k_gt128k_benchmark.jsonl
+        prompt_config: null
+        # Required by Gym's schema; the data is pre-built (see header).
+        prepare_script: benchmarks/mrcr/prepare.py
+        num_repeats: 1
+
+mrcr_qwen38_196k_gt128k_benchmark_environment_server:
+  _inherit_from: mrcr_environment_server
+  environment_servers:
+    legacy_agent:
+      agent_server:
+        name: mrcr_qwen38_196k_gt128k_benchmark_simple_agent

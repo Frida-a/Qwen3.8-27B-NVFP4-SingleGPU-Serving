@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 06:24:29 -0800
+Subject: [PATCH] [QW38] verify v2 stage B on the fold branch
+ (VLLM_GDN_VERIFY_V2=1), incl. the deferred-commit verify
+
+Port of the verify v2 stage B (chunked UT/WY verify, split-tf32
+exact-operand MMAs, BV 64) to the fold verify (VLLM_GDN_RECOVER_FOLD=1):
+phase 1 replays the previous step's pending records with the shipped serial
+code (_gdn_replay_record + the int16 quantizer) on [SBV, BK] sub-tiles and stores
+the folded state in place, then a CTA barrier; phase 2 re-reads the stored
+state for the chunked verify (identical values; keeps the replay's registers
+free). The folded state is bit-identical to the commit kernel's (fold poison gate
+25/25 with the env set: fold-B == eager-B). Records/ring halves/single-buffered u
+unchanged. Window > 1 and stage A ("A" is not ported here) use the shipped verify.
+Knobs VLLM_GDN_VERIFY_V2_{BV,WARPS,PREC,SBV}. Proof: "GDN recover verify v2
+(QW38 verify-v2): mode B fold (BV 64, warps 4, dot split)".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/mamba/ops/gdn_recover_spec.py      | 368 ++++++++++++++++++
+ 1 file changed, 368 insertions(+)
+
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index 891849b33..35ef34820 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -29,6 +29,7 @@ implemented; the others are reserved dispatch points (per-head rows are
+ padded to `VP`, e.g. V + 2 for the int16 row-scaled format).
+ """
+ 
++import os
+ from dataclasses import dataclass
+ 
+ import torch
+@@ -64,6 +65,48 @@ _NUM_WARPS = 4
+ _NUM_STAGES = 3
+ 
+ 
++# QW38 verify-v2 on the fold branch (VLLM_GDN_VERIFY_V2): unset / "0" = shipped verify.
++#   "B" or "1": chunked (UT/WY) verify for window 1, incl. the deferred-commit (fold) path:
++#        the pending-record replay + in-place requantized store stay the serial,
++#        bit-identical code on 32-row sub-tiles; the T verify tokens use small
++#        split-tf32 matmuls (ulp-level vs ship). "A" is not ported here (-> ship).
++_VERIFY_V2 = os.environ.get("VLLM_GDN_VERIFY_V2", "0").strip().upper()
++if _VERIFY_V2 in ("", "0"):
++    _VERIFY_V2 = "0"
++elif _VERIFY_V2 == "1":
++    _VERIFY_V2 = "B"
++elif _VERIFY_V2 not in ("A", "B"):
++    raise ValueError(f"VLLM_GDN_VERIFY_V2={_VERIFY_V2!r}: expected 0, 1, A or B")
++_V2B_BV = int(os.environ.get("VLLM_GDN_VERIFY_V2_BV", "64"))
++_V2B_WARPS = int(os.environ.get("VLLM_GDN_VERIFY_V2_WARPS", "4"))
++_V2B_PREC = os.environ.get("VLLM_GDN_VERIFY_V2_PREC", "split")
++_V2B_MIN_N = int(os.environ.get("VLLM_GDN_VERIFY_V2B_MIN_N", "1"))
++# State rows per fold sub-tile (the pending-record replay + requantized store).
++_V2B_SBV = int(os.environ.get("VLLM_GDN_VERIFY_V2_SBV", "64"))
++_v2_logged: set = set()
++
++
++def _log_v2_once(mode: str, defer: bool) -> None:
++    key = (mode, defer)
++    if key not in _v2_logged:
++        _v2_logged.add(key)
++        from vllm.logger import init_logger
++
++        if mode == "B":
++            init_logger(__name__).info(
++                "GDN recover verify v2 (QW38 verify-v2): mode B%s (BV %d, warps %d, dot %s)",
++                " fold" if defer else "",
++                _V2B_BV,
++                _V2B_WARPS,
++                _V2B_PREC,
++            )
++        else:
++            init_logger(__name__).warning(
++                "GDN recover verify v2 (QW38 verify-v2): stage A is not ported to the "
++                "fold branch; using the shipped verify"
++            )
++
++
+ def gdn_state_padded_rows(fmt: str, head_v_dim: int, head_k_dim: int) -> int:
+     """Rows `VP` of one head's stored state block [VP, K] for a state format."""
+     if fmt not in GDN_STATE_FORMATS:
+@@ -418,6 +461,263 @@ def _gdn_recover_verify_kernel(
+         p_a += stride_a_tok
+ 
+ 
++# --------------------------------------------------------------------------
++# Verify v2, stage B (QW38 verify-v2), with the deferred-commit fold
++# --------------------------------------------------------------------------
++
++
++@triton.jit
++def _tf32_hi(x):
++    """x rounded down to a tf32-exact value (low 13 mantissa bits cleared)."""
++    return (x.to(tl.int32, bitcast=True) & -8192).to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _v2_dot(a, b, PREC: tl.constexpr):
++    """a @ b in fp32 accuracy class PREC. "split": a = ah + al, b = bh + bl with
++    tf32-exact hi parts; ah bh + ah bl + al bh (3 tf32 MMAs, rel. error ~2^-21)."""
++    if PREC == "split":
++        ah = _tf32_hi(a)
++        bh = _tf32_hi(b)
++        acc = tl.dot(a - ah, bh, input_precision="tf32")
++        acc = tl.dot(ah, b - bh, acc, input_precision="tf32")
++        return tl.dot(ah, bh, acc, input_precision="tf32")
++    else:
++        return tl.dot(a, b, input_precision=PREC)
++
++
++@triton.jit(do_not_specialize=["T"])
++def _gdn_recover_verify_v2b_kernel(
++    A_log,
++    a,
++    b,
++    dt_bias,
++    q,
++    k,
++    v,
++    o,
++    state,
++    rec_u,
++    rec_k,
++    rec_g,
++    cu_seqlens,
++    slot_indices,
++    req_indices,
++    defer_half,
++    defer_pending,
++    beta,
++    threshold,
++    scale,
++    T,
++    stride_q_tok,
++    stride_k_tok,
++    stride_v_tok,
++    stride_a_tok,
++    stride_b_tok,
++    stride_o_tok,
++    stride_state_slot,
++    stride_u_slot,
++    stride_rk_slot,
++    stride_g_slot,
++    stride_slot_idx,
++    stride_req_idx,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    VP: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    SBV: tl.constexpr,
++    BT: tl.constexpr,
++    LOG2_BT: tl.constexpr,
++    R: tl.constexpr,
++    FMT: tl.constexpr,
++    RECORDS_BY_ROW: tl.constexpr,
++    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++    DOT_PREC: tl.constexpr,
++    DEFER: tl.constexpr = False,
++    HALF: tl.constexpr = 1,
++    RU: tl.constexpr = 0,
++):
++    """Stage B verify (window 1), optionally with the deferred-commit fold.
++
++    Same math as the non-fold verify v2 stage B: with G = cumsum(g),
++    u = (I+N)^-1 diag(beta) (v - Gam S0 k), o = Gam S0 q + M u, N = strictly
++    lower beta-scaled decayed key Gram (nilpotent: (I+N)^-1 = (I-N)(I+N^2)...),
++    rows/cols < BT keys, >= BT queries. The BT-sized matrices are computed once
++    per program; the BV state rows are processed as BV / SBV sub-tiles of SBV
++    rows, so the fold (DEFER: replay of the previous step's accepted records +
++    in-place requantized store) runs on the same [SBV, BK] tiles and code as
++    the shipped fold verify / commit kernel (bit-identical folded state).
++    """
++    i_v, i_nh = tl.program_id(0), tl.program_id(1)
++    i_n, i_hv = i_nh // HV, i_nh % HV
++    i_h = i_hv // (HV // H)
++    bos, eos = (
++        tl.load(cu_seqlens + i_n).to(tl.int64),
++        tl.load(cu_seqlens + i_n + 1).to(tl.int64),
++    )
++    T = eos - bos
++    if T == 0:
++        return
++    slot = tl.load(slot_indices + i_n * stride_slot_idx).to(tl.int64)
++    if slot <= 0:
++        return
++
++    o_k = tl.arange(0, BK)
++    mask_k = o_k < K
++
++    # Records: request row (fold), spec row (by_row) or slot.
++    rec = slot
++    if RECORDS_BY_ROW:
++        rec = i_n.to(tl.int64)
++    if DEFER:
++        rec = tl.load(req_indices + i_n * stride_req_idx).to(tl.int64)
++    RU_: tl.constexpr = R if RU == 0 else RU
++    U_SINGLE: tl.constexpr = DEFER and RU_ == HALF
++    pos0 = 0
++    p_state = state + slot * stride_state_slot + i_hv * VP * K
++    p_rk = rec_k + rec * stride_rk_slot + i_h * R * K + o_k
++    p_g = rec_g + rec * stride_g_slot + i_hv * R
++
++    if DEFER:
++        rd = tl.load(defer_half + rec)
++        pending = tl.load(defer_pending + rec)
++        pos0 = (1 - rd) * HALF
++        if pending > 0:
++            # Phase 1, fold: same ops as the shipped fold verify (load, serial
++            # replay, gdn_spec_store_requant_state) on [SBV, BK] sub-tiles; the
++            # chunk below re-reads the stored state (identical values).
++            for s in tl.static_range(BV // SBV):
++                o_v = i_v * BV + s * SBV + tl.arange(0, SBV)
++                mask_v = o_v < V
++                mask_h = mask_v[:, None] & mask_k[None, :]
++                p_u = rec_u + rec * stride_u_slot + i_hv * RU_ * V + o_v
++                b_h = tl.zeros([SBV, BK], dtype=tl.float32)
++                b_h += gdn_spec_load_state(p_state, o_v, o_k, mask_v, mask_h, V, K, FMT)
++                for j in range(0, pending):
++                    ju = j if U_SINGLE else rd * HALF + j
++                    b_h = _gdn_replay_record(
++                        b_h,
++                        p_u + ju * V,
++                        p_rk + (rd * HALF + j) * K,
++                        p_g + rd * HALF + j,
++                        mask_k,
++                        mask_v,
++                        USE_QK_L2NORM_IN_KERNEL,
++                    )
++                gdn_spec_store_state(p_state, b_h, o_v, o_k, mask_v, mask_h, V, K, FMT)
++            # Stores visible to the whole program before the re-read, and the
++            # pending u rows read before this step's u rows are written.
++            tl.debug_barrier()
++
++    o_c = tl.arange(0, 2 * BT)
++    t_c = o_c % BT
++    is_k = o_c < BT
++    is_q = o_c >= BT
++    mask_c = t_c < T
++    tok_c = bos + t_c
++    kmask_c = is_k & mask_c
++
++    p_x = tl.where(
++        is_k[:, None],
++        k + tok_c[:, None] * stride_k_tok + i_h * K + o_k[None, :],
++        q + tok_c[:, None] * stride_q_tok + i_h * K + o_k[None, :],
++    )
++    b_xr = tl.load(p_x, mask=mask_c[:, None] & mask_k[None, :], other=0)
++    b_x = b_xr.to(tl.float32)
++    if USE_QK_L2NORM_IN_KERNEL:
++        b_x = b_x * tl.rsqrt(tl.sum(b_x * b_x, 1) + 1e-6)[:, None]
++    b_x = tl.where(is_q[:, None], b_x * scale, b_x)
++
++    o_t = tl.arange(0, BT)
++    mask_t = o_t < T
++    x = tl.load(a + (bos + o_t) * stride_a_tok + i_hv, mask=mask_t, other=0).to(
++        tl.float32
++    ) + tl.load(dt_bias + i_hv).to(tl.float32)
++    softplus_x = tl.where(
++        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
++    )
++    b_g = -tl.exp(tl.load(A_log + i_hv).to(tl.float32)) * softplus_x
++    b_g = tl.where(mask_t, b_g, 0.0)
++    G_c = tl.sum(tl.where(o_t[None, :] <= t_c[:, None], b_g[None, :], 0.0), 1)
++    gam_c = tl.exp(G_c)
++    b_b = tl.load(b + tok_c * stride_b_tok + i_hv, mask=kmask_c, other=0).to(tl.float32)
++    beta_c = tl.where(kmask_c, tl.sigmoid(b_b), 0.0)
++
++    gram = _v2_dot(b_x, tl.trans(b_x), DOT_PREC)
++    tr = t_c[:, None]
++    tcol = t_c[None, :]
++    rk = is_k[:, None]
++    ck = is_k[None, :]
++    rq = is_q[:, None]
++    dec = tl.exp(tl.where(tcol <= tr, G_c[:, None] - G_c[None, :], 0.0))
++    b_N = tl.where(rk & ck & (tcol < tr), beta_c[:, None] * (dec * gram), 0.0)
++    b_M = tl.where(rq & ck & (tcol <= tr), dec * gram, 0.0)
++    eye = tl.where(o_c[:, None] == o_c[None, :], 1.0, 0.0)
++    b_L = eye - b_N
++    b_Np = b_N
++    for _ in tl.static_range(LOG2_BT - 1):
++        b_Np = _v2_dot(b_Np, b_Np, DOT_PREC)
++        b_L = _v2_dot(b_L, eye + b_Np, DOT_PREC)
++    b_P = b_L * beta_c[None, :]
++    b_Zt = _v2_dot(eye + b_M, b_P, DOT_PREC)
++    b_xt = tl.trans(b_x)
++    if DOT_PREC == "split" and FMT == _FMT_INT16_ROW:
++        b_xh = _tf32_hi(b_xt)
++        b_xl = b_xt - b_xh
++
++    # Phase 2: chunked verify on the (folded) state, BV rows.
++    o_v = i_v * BV + tl.arange(0, BV)
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & mask_k[None, :]
++    if FMT == _FMT_INT16_ROW:
++        b_c = tl.load(p_state + o_v[:, None] * K + o_k[None, :], mask=mask_h, other=0).to(
++            tl.int32
++        )
++        p_scale = (p_state + V * K).to(tl.pointer_type(tl.float32), bitcast=True)
++        b_sc = tl.load(p_scale + o_v, mask=mask_v, other=0.0)
++        if DOT_PREC == "split":
++            b_chi = (b_c & -256).to(tl.float32)
++            b_clo = (b_c & 255).to(tl.float32)
++            acc = tl.dot(b_clo, b_xl, input_precision="tf32")
++            acc = tl.dot(b_chi, b_xl, acc, input_precision="tf32")
++            acc = tl.dot(b_clo, b_xh, acc, input_precision="tf32")
++            acc = tl.dot(b_chi, b_xh, acc, input_precision="tf32")
++            b_w = acc * b_sc[:, None] * gam_c[None, :]
++        else:
++            b_hf = b_c.to(tl.float32) * b_sc[:, None]
++            b_w = _v2_dot(b_hf, b_xt, DOT_PREC) * gam_c[None, :]
++    else:
++        b_hf = gdn_spec_load_state(p_state, o_v, o_k, mask_v, mask_h, V, K, FMT)
++        b_w = _v2_dot(b_hf, b_xt, DOT_PREC) * gam_c[None, :]
++    p_vt = v + tok_c[None, :] * stride_v_tok + i_hv * V + o_v[:, None]
++    b_vt = tl.load(p_vt, mask=mask_v[:, None] & kmask_c[None, :], other=0).to(
++        tl.float32
++    )
++    b_r = tl.where(ck, b_vt - b_w, 0.0)
++    b_out = _v2_dot(b_r, tl.trans(b_Zt), DOT_PREC) + tl.where(ck, 0.0, b_w)
++    # u record of token t: row t (single-buffered) or ring row pos0 + t.
++    if U_SINGLE:
++        u_row = t_c
++    else:
++        u_row = pos0 + t_c
++    p_ur = rec_u + rec * stride_u_slot + i_hv * RU_ * V + u_row[None, :] * V + o_v[:, None]
++    tl.store(p_ur, b_out, mask=mask_v[:, None] & kmask_c[None, :])
++    p_o = o + tok_c[None, :] * stride_o_tok + i_hv * V + o_v[:, None]
++    tl.store(
++        p_o,
++        b_out.to(p_o.dtype.element_ty),
++        mask=mask_v[:, None] & (is_q & mask_c)[None, :],
++    )
++    if i_v == 0:
++        tl.store(p_g + pos0 + o_t, b_g, mask=mask_t)
++    if (i_v == 0) & (i_hv % (HV // H) == 0):
++        p_rkw = rec_k + rec * stride_rk_slot + i_h * R * K + (pos0 + t_c)[:, None] * K + o_k[None, :]
++        tl.store(p_rkw, b_xr, mask=kmask_c[:, None] & mask_k[None, :])
++
++
+ @dataclass
+ class GDNRecoverRecords:
+     """One GDN layer's record rings.
+@@ -599,6 +899,7 @@ def gdn_recover_verify(
+     use_qk_l2norm_in_kernel: bool = True,
+     req_indices: torch.Tensor | None = None,
+     defer: GDNRecoverDeferTrackers | None = None,
++    verify_v2: str | None = None,
+ ) -> torch.Tensor:
+     """Verify spec tokens off each request's checkpoint without storing states.
+ 
+@@ -667,6 +968,73 @@ def gdn_recover_verify(
+         defer_half, defer_pending = defer.half, defer.pending
+     else:
+         req_indices = defer_half = defer_pending = slot_indices
++    mode = _VERIFY_V2 if verify_v2 is None else verify_v2
++    if verify_v2 is None and mode == "B" and (window != 1 or N < _V2B_MIN_N):
++        mode = "0"
++    if mode == "A":
++        _log_v2_once("A", defer is not None)
++        mode = "0"
++    if mode == "B" and window == 1:
++        _log_v2_once("B", defer is not None)
++        BT = max(8, triton.next_power_of_2(records.u_len if records.u_single else (R // 2 if defer is not None else R)))
++        BVB = min(_V2B_BV, triton.next_power_of_2(V))
++        SBV = min(_V2B_SBV, BVB)
++        _gdn_recover_verify_v2b_kernel[(triton.cdiv(V, BVB), N * HV)](
++            A_log,
++            a,
++            b,
++            dt_bias,
++            q,
++            k,
++            v,
++            out,
++            state,
++            records.u,
++            records.k,
++            records.g,
++            cu_seqlens,
++            slot_indices,
++            req_indices,
++            defer_half,
++            defer_pending,
++            softplus_beta,
++            softplus_threshold,
++            scale,
++            T,
++            q.stride(0),
++            k.stride(0),
++            v.stride(0),
++            a.stride(0),
++            b.stride(0),
++            out.stride(0),
++            state.stride(0),
++            records.u.stride(0),
++            records.k.stride(0),
++            records.g.stride(0),
++            slot_indices.stride(0),
++            req_indices.stride(0),
++            H=H,
++            HV=HV,
++            K=K,
++            V=V,
++            VP=VP,
++            BK=BK,
++            BV=BVB,
++            SBV=SBV,
++            BT=BT,
++            LOG2_BT=BT.bit_length() - 1,
++            R=R,
++            FMT=GDN_STATE_FORMATS[fmt],
++            RECORDS_BY_ROW=records.by_row,
++            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
++            DOT_PREC=_V2B_PREC,
++            DEFER=defer is not None,
++            HALF=R // 2 if defer is not None else 1,
++            RU=records.u_len,
++            num_warps=_V2B_WARPS,
++            num_stages=1,
++        )
++        return out
+     grid = (NV, N * HV)
+     _gdn_recover_verify_kernel[grid](
+         A_log,

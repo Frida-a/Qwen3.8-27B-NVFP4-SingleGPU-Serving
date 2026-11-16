@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:42:12 -0800
+Subject: [PATCH] [Kernel] K8V4 decode: register-broadcast V scales by default
+
+SM120 kernel bench: bcast=1 is 2-25% faster than the expanded
+scale loads (e.g. 32K c=1 38.2 vs 52.4 us, 1K c=16 18.1 vs 24.1 us).
+Identical numerics (same scale values). VLLM_K8V4_SCALE_BCAST=0 restores
+the old loads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/ops/k8v4_kv.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/v1/attention/ops/k8v4_kv.py b/vllm/v1/attention/ops/k8v4_kv.py
+index 4d1443e9a..b7322d914 100644
+--- a/vllm/v1/attention/ops/k8v4_kv.py
++++ b/vllm/v1/attention/ops/k8v4_kv.py
+@@ -505,7 +505,7 @@ def k8v4_decode(
+         BLOCK_M=block_m,
+         QLEN=q_len_per_req,
+         RAGGED=ragged,
+-        SCALE_BCAST=os.environ.get("VLLM_K8V4_SCALE_BCAST", "0") == "1",
++        SCALE_BCAST=os.environ.get("VLLM_K8V4_SCALE_BCAST", "1") == "1",
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )

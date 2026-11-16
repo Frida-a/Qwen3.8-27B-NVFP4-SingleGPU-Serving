@@ -1,0 +1,507 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:28:36 -0800
+Subject: [PATCH] [Spec decode] Reduced draft vocabulary for drafters sharing
+ the target lm_head (B17)
+
+speculative_config.draft_vocab_ids = path to a JSON/.npy list of sorted,
+unique target ids. The MTP drafter projects onto those Vd rows through a
+separate lm_head built from the same checkpoint rows (NVFP4 rows + block
+scales + global scales, processed by the head's own quant method), so a
+subset logit equals the matching full-head logit; the target keeps its
+full head. Greedy drafts take the subset argmax mapped to target ids;
+probabilistic drafts scatter the subset logits into a persistent
+full-vocab row that is -inf elsewhere, so q is exactly the subset softmax
+(q=0 outside) and rejection sampling stays lossless. Load logs Vd, head
+bytes and a self-check vs the full head. VLLM_SPEC_DRAFT_VOCAB=0 ignores
+the option (old path). TP=1 only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/config/speculative.py                    |  10 +
+ vllm/v1/worker/gpu/spec_decode/draft_vocab.py | 324 ++++++++++++++++++
+ vllm/v1/worker/gpu/spec_decode/mtp/config.py  |   3 +-
+ vllm/v1/worker/gpu/spec_decode/speculator.py  |  68 +++-
+ 4 files changed, 401 insertions(+), 4 deletions(-)
+ create mode 100644 vllm/v1/worker/gpu/spec_decode/draft_vocab.py
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index f43dc9be6..28a159025 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -132,6 +132,7 @@ _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
+ _METHOD_SPECIFIC_OPTIONS = (
+     "dspark_draft_topk",
+     "draft_lm_head_quantization",
++    "draft_vocab_ids",
+     "index_share_for_mtp_iteration",
+     "xpress_topc",
+     "speculator_options",
+@@ -579,6 +580,14 @@ class SpeculativeConfig:
+     activation scales on the platform's FP8 linear kernel; "nvfp4" is
+     weight-only on the platform's W4A16 kernel. The target verifies with its
+     own head, so only the acceptance length can change."""
++    draft_vocab_ids: str | None = None
++    """Path to a JSON list (or {"ids": [...]}) or .npy array of sorted, unique
++    target token ids. The drafter projects onto these rows only, through a
++    reduced copy of the target lm_head it shares (quantized heads keep their
++    format). Greedy drafts take the subset argmax; probabilistic drafts use the
++    exact subset softmax (q = 0 outside the subset), so rejection sampling
++    stays lossless. Only the acceptance length can change. TP=1 only.
++    `VLLM_SPEC_DRAFT_VOCAB=0` ignores it."""
+     use_local_argmax_reduction: bool = False
+     """Use vocab-parallel local argmax instead of all-gathering full logits
+     for draft token generation. Reduces communication from O(vocab_size) to
+@@ -780,6 +789,7 @@ class SpeculativeConfig:
+             "disable_eagle_block_drop",
+             "disable_lookahead_block_hashes",
+             "draft_lm_head_quantization",
++            "draft_vocab_ids",
+             "use_local_argmax_reduction",
+             "prompt_lookup_max",
+             "prompt_lookup_min",
+diff --git a/vllm/v1/worker/gpu/spec_decode/draft_vocab.py b/vllm/v1/worker/gpu/spec_decode/draft_vocab.py
+new file mode 100644
+index 000000000..7ad1e0054
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/draft_vocab.py
+@@ -0,0 +1,324 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Reduced draft vocabulary for drafters that share the target lm_head.
++
++`speculative_config.draft_vocab_ids` names a JSON (a list, or a dict with an
++"ids" list) or .npy file of sorted, unique target token ids. The drafter then
++projects onto those Vd rows only, through a separate lm_head built from the
++same checkpoint rows (quantized heads keep their format: NVFP4 rows and their
++block scales are read from the checkpoint and run through the head's own
++quant method, so a subset logit equals the matching full-head logit). The
++target keeps, and verifies with, its full head.
++
++- Greedy drafts take the argmax over the subset and map it to the target id.
++- Probabilistic drafts scatter the subset logits into a full-vocabulary row
++  that is -inf everywhere else, so the draft distribution q handed to
++  rejection sampling is exactly softmax over the subset (q = 0 outside it)
++  and rejection sampling stays lossless.
++
++`VLLM_SPEC_DRAFT_VOCAB=0` ignores the option and keeps the full head.
++"""
++
++import hashlib
++import itertools
++import json
++import os
++
++import numpy as np
++import torch
++import torch.nn as nn
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENV_SWITCH = "VLLM_SPEC_DRAFT_VOCAB"
++
++
++def draft_vocab_disabled_by_env() -> bool:
++    return os.environ.get(ENV_SWITCH, "1").strip().lower() in (
++        "0",
++        "false",
++        "off",
++        "no",
++    )
++
++
++def load_draft_vocab_ids(path: str, target_vocab_size: int) -> np.ndarray:
++    """Read and validate a draft vocabulary: sorted, unique, in range."""
++    if path.endswith(".npy"):
++        ids = np.load(path)
++    else:
++        with open(path) as f:
++            obj = json.load(f)
++        ids = obj["ids"] if isinstance(obj, dict) else obj
++    ids = np.asarray(ids, dtype=np.int64)
++    if ids.ndim != 1 or ids.size == 0:
++        raise ValueError(f"draft_vocab_ids {path}: expected a non-empty 1-D list")
++    if np.any(np.diff(ids) <= 0):
++        raise ValueError(f"draft_vocab_ids {path}: ids must be sorted and unique")
++    if ids[0] < 0 or ids[-1] >= target_vocab_size:
++        raise ValueError(
++            f"draft_vocab_ids {path}: ids must lie in [0, {target_vocab_size})"
++        )
++    return ids
++
++
++def file_sha256(path: str) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for chunk in iter(lambda: f.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def module_nbytes(module: nn.Module) -> int:
++    """Bytes of every tensor a module holds (params, buffers and tensors the
++    kernels stash as plain attributes), each storage counted once."""
++    seen: set[int] = set()
++    total = 0
++    tensors = itertools.chain(
++        module.parameters(recurse=False),
++        module.buffers(recurse=False),
++        (v for v in vars(module).values() if isinstance(v, torch.Tensor)),
++    )
++    for t in tensors:
++        if t.device.type == "meta":
++            continue
++        ptr = t.untyped_storage().data_ptr()
++        if ptr in seen:
++            continue
++        seen.add(ptr)
++        total += t.untyped_storage().nbytes()
++    return total
++
++
++def _resolve_model_dir(model: str) -> str:
++    if os.path.isdir(model):
++        return model
++    from huggingface_hub import snapshot_download
++
++    return snapshot_download(model, local_files_only=True)
++
++
++def _read_checkpoint_head(model_dir: str) -> dict[str, torch.Tensor]:
++    """The target lm_head tensors from the checkpoint, keyed by param name
++    (weight, weight_scale, weight_scale_2, input_scale, ...)."""
++    from safetensors import safe_open
++
++    index = os.path.join(model_dir, "model.safetensors.index.json")
++    if os.path.exists(index):
++        with open(index) as f:
++            weight_map = json.load(f)["weight_map"]
++    else:
++        weight_map = {}
++        for fn in sorted(os.listdir(model_dir)):
++            if fn.endswith(".safetensors"):
++                with safe_open(os.path.join(model_dir, fn), "pt") as f:
++                    weight_map.update({k: fn for k in f.keys()})  # noqa: SIM118
++    heads = sorted(
++        {
++            k.rsplit(".", 1)[0]
++            for k in weight_map
++            if k.endswith("lm_head.weight") and not k.startswith("mtp.")
++        }
++    )
++    if len(heads) != 1:
++        raise RuntimeError(
++            f"draft_vocab_ids: expected one target lm_head in {model_dir}, "
++            f"found {heads}"
++        )
++    head = heads[0]
++    out: dict[str, torch.Tensor] = {}
++    for key, fn in weight_map.items():
++        if key.startswith(head + "."):
++            with safe_open(os.path.join(model_dir, fn), "pt") as f:
++                out[key[len(head) + 1 :]] = f.get_tensor(key)
++    return out
++
++
++class DraftVocabHead:
++    """A reduced lm_head over `ids` plus the draft->target id map."""
++
++    def __init__(
++        self,
++        head: nn.Module,
++        logits_processor: nn.Module,
++        ids: torch.Tensor,
++        vocab_size: int,
++        scatter_rows: int,
++        scatter_dtype: torch.dtype | None,
++    ) -> None:
++        self.head = head
++        self.logits_processor = logits_processor
++        # [Vd] int64 target ids, sorted
++        self.ids = ids
++        self.vocab_size = vocab_size
++        self.scatter_buf: torch.Tensor | None = None
++        if scatter_dtype is not None:
++            # -inf once: each step overwrites only the subset columns, so the
++            # rest stays -inf (q = 0 outside the subset).
++            self.scatter_buf = torch.full(
++                (scatter_rows, vocab_size),
++                float("-inf"),
++                dtype=scatter_dtype,
++                device=ids.device,
++            )
++
++    @property
++    def size(self) -> int:
++        return self.ids.shape[0]
++
++    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """[N, Vd] logits over the subset (same path as the full head)."""
++        return self.logits_processor(self.head, hidden_states)
++
++    def to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
++        return self.ids[draft_ids]
++
++    def scatter(self, sub_logits: torch.Tensor) -> torch.Tensor:
++        """[N, V] logits: the subset logits at their target ids, -inf
++        elsewhere. Returns a view of a persistent buffer (CUDA-graph safe)."""
++        assert self.scatter_buf is not None
++        buf = self.scatter_buf[: sub_logits.shape[0]]
++        buf.index_copy_(1, self.ids, sub_logits.to(buf.dtype))
++        return buf
++
++
++def build_draft_vocab_head(
++    vllm_config,
++    full_head: nn.Module,
++    full_logits_processor: nn.Module,
++    path: str,
++    device: torch.device,
++    scatter_rows: int,
++    scatter_dtype: torch.dtype | None,
++) -> DraftVocabHead:
++    """Build the reduced head for a drafter whose lm_head is `full_head`
++    (the target's head, shared) and self-check it against the full head."""
++    from vllm.config import set_current_vllm_config
++    from vllm.model_executor.layers.logits_processor import LogitsProcessor
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        ParallelLMHead,
++        UnquantizedEmbeddingMethod,
++    )
++    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++    from vllm.utils.torch_utils import set_default_torch_dtype
++
++    if getattr(full_head, "tp_size", 1) != 1:
++        raise NotImplementedError("draft_vocab_ids supports only a TP=1 lm_head")
++    vocab_size = full_logits_processor.org_vocab_size
++    ids_np = load_draft_vocab_ids(path, vocab_size)
++    vd = int(ids_np.size)
++    ids_cpu = torch.from_numpy(ids_np)
++    model_config = vllm_config.model_config
++    full_qm = full_head.quant_method
++    unquantized = isinstance(
++        full_qm, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
++    )
++
++    with (
++        set_current_vllm_config(vllm_config),
++        set_default_torch_dtype(model_config.dtype),
++        torch.device(device),
++    ):
++        head = ParallelLMHead(
++            vd,
++            full_head.embedding_dim,
++            bias=False,
++            params_dtype=full_head.params_dtype,
++            quant_config=getattr(full_head, "quant_config", None),
++            prefix=full_head.prefix,
++        )
++        if type(head.quant_method) is not type(full_qm) or getattr(
++            head.quant_method, "spec", None
++        ) != getattr(full_qm, "spec", None):
++            raise RuntimeError(
++                "draft_vocab_ids: the reduced lm_head resolved quant method "
++                f"{type(head.quant_method).__name__}, but the target head uses "
++                f"{type(full_qm).__name__}"
++            )
++        lp = LogitsProcessor(
++            vd,
++            scale=full_logits_processor.scale,
++            soft_cap=full_logits_processor.soft_cap,
++        )
++
++    if unquantized:
++        # Plain rows: gather straight from the (shared) target head.
++        source = "target head rows (unquantized)"
++        with torch.no_grad():
++            head.weight.zero_()
++            head.weight[:vd].copy_(full_head.weight[ids_cpu.to(device)])
++    else:
++        source = f"checkpoint rows ({type(full_qm).__name__})"
++        model_dir = _resolve_model_dir(model_config.model_weights or model_config.model)
++        ckpt = _read_checkpoint_head(model_dir)
++        with torch.no_grad():
++            for name, param in head.named_parameters(recurse=False):
++                if name not in ckpt:
++                    raise RuntimeError(
++                        f"draft_vocab_ids: checkpoint lm_head has no {name!r} "
++                        f"(has {sorted(ckpt)})"
++                    )
++                t = ckpt[name]
++                if getattr(param, "output_dim", None) == 0 and t.ndim >= 1:
++                    if t.shape[0] != vocab_size:
++                        raise RuntimeError(
++                            f"draft_vocab_ids: checkpoint lm_head.{name} has "
++                            f"{t.shape[0]} rows, expected {vocab_size}"
++                        )
++                    t = t.index_select(0, ids_cpu)
++                param.weight_loader(param, t)
++            del ckpt
++        if hasattr(head.quant_method, "process_weights_after_loading"):
++            head.quant_method.process_weights_after_loading(head)
++
++    ids = ids_cpu.to(device)
++    dv = DraftVocabHead(head, lp, ids, vocab_size, scatter_rows, scatter_dtype)
++
++    # Self-check on random hidden states: subset logits vs the gathered full
++    # logits, same kernel path.
++    with torch.inference_mode(), set_current_vllm_config(vllm_config):
++        g = torch.Generator(device=device).manual_seed(0)
++        h = torch.randn(
++            8,
++            full_head.embedding_dim,
++            generator=g,
++            device=device,
++            dtype=model_config.dtype,
++        )
++        sub = dv.compute_logits(h).float()
++        ref = full_logits_processor(full_head, h).float()[:, ids]
++        max_diff = (sub - ref).abs().max().item()
++        exact = bool(torch.equal(sub, ref))
++        same_argmax = bool(torch.equal(sub.argmax(-1), ref.argmax(-1)))
++
++    full_bytes = module_nbytes(full_head)
++    sub_bytes = module_nbytes(head)
++    logger.info(
++        "Draft vocab (B17): Vd=%d of V=%d from %s (sha256 %s); reduced lm_head "
++        "%.1f MB vs full %.1f MB (%.3fx), source=%s; selfcheck vs full head: "
++        "exact=%s max|diff|=%.3g argmax_match=%s; drafts=%s",
++        vd,
++        vocab_size,
++        path,
++        file_sha256(path)[:16],
++        sub_bytes / 1e6,
++        full_bytes / 1e6,
++        sub_bytes / max(full_bytes, 1),
++        source,
++        exact,
++        max_diff,
++        same_argmax,
++        "probabilistic (scatter, -inf outside)"
++        if scatter_dtype is not None
++        else "greedy (subset argmax -> target id)",
++    )
++    if not same_argmax:
++        logger.warning(
++            "Draft vocab (B17): reduced head disagrees with the full head on "
++            "random inputs (max|diff|=%.3g)",
++            max_diff,
++        )
++    return dv
+diff --git a/vllm/v1/worker/gpu/spec_decode/mtp/config.py b/vllm/v1/worker/gpu/spec_decode/mtp/config.py
+index 47139f1c0..6e177e716 100644
+--- a/vllm/v1/worker/gpu/spec_decode/mtp/config.py
++++ b/vllm/v1/worker/gpu/spec_decode/mtp/config.py
+@@ -19,7 +19,8 @@ class MTPSpeculatorConfig(EagleSpeculatorConfig):
+     base_method = "mtp"
+     speculator_class = "vllm.v1.worker.gpu.spec_decode.mtp.speculator.MTPSpeculator"
+     supported_options = EagleSpeculatorConfig.supported_options | {
+-        "index_share_for_mtp_iteration"
++        "index_share_for_mtp_iteration",
++        "draft_vocab_ids",
+     }
+     supports_pcp = True
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 7992d979a..efb1bcd02 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -42,6 +42,14 @@ from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+     OnlineAcceptanceEstimator,
+ )
+ from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
++from vllm.v1.worker.gpu.spec_decode.draft_vocab import (
++    ENV_SWITCH as DRAFT_VOCAB_ENV_SWITCH,
++)
++from vllm.v1.worker.gpu.spec_decode.draft_vocab import (
++    DraftVocabHead,
++    build_draft_vocab_head,
++    draft_vocab_disabled_by_env,
++)
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ if TYPE_CHECKING:
+@@ -260,6 +268,8 @@ class DraftModelSpeculator(BaseSpeculator):
+ 
+         self.supports_mm_inputs = False
+         self.pcp_manager: PCPManager | None = None
++        # Reduced draft vocabulary (speculative_config.draft_vocab_ids).
++        self.draft_vocab: DraftVocabHead | None = None
+         # Whether every draft attention builder can refresh its decode metadata
+         # in place, so the refresh can be recorded in the draft CUDA graph.
+         self.supports_decode_metadata_update = False
+@@ -323,6 +333,50 @@ class DraftModelSpeculator(BaseSpeculator):
+                 self.num_speculative_steps,
+                 self.device,
+             )
++        self._maybe_init_draft_vocab()
++
++    def _maybe_init_draft_vocab(self) -> None:
++        path = getattr(self.speculative_config, "draft_vocab_ids", None)
++        if path is None:
++            return
++        if draft_vocab_disabled_by_env():
++            logger.info(
++                "Draft vocab (B17): %s=0, ignoring draft_vocab_ids=%s; drafting "
++                "with the full lm_head.",
++                DRAFT_VOCAB_ENV_SWITCH,
++                path,
++            )
++            return
++        if type(self).compute_draft_logits is not Speculator.compute_draft_logits:
++            raise NotImplementedError(
++                f"draft_vocab_ids is not supported by {type(self).__name__}, "
++                "which computes its own draft logits."
++            )
++        head = getattr(self.model, "lm_head", None)
++        logits_processor = getattr(self.model, "logits_processor", None)
++        if head is None or logits_processor is None:
++            raise NotImplementedError(
++                "draft_vocab_ids needs a drafter with lm_head and "
++                f"logits_processor; {type(self.model).__name__} has none."
++            )
++        need_full_rows = (
++            self.draft_logits is not None or self.acceptance_estimator is not None
++        )
++        self.draft_vocab = build_draft_vocab_head(
++            self.vllm_config,
++            head,
++            logits_processor,
++            path,
++            self.device,
++            scatter_rows=self.max_num_reqs,
++            scatter_dtype=(
++                self.draft_logits.values.dtype
++                if self.draft_logits is not None
++                else self.dtype
++            )
++            if need_full_rows
++            else None,
++        )
+ 
+     def free_unused_weights(self, target_model: nn.Module) -> None:
+         """Free the draft weights this instance never reads. The model runner
+@@ -592,10 +646,18 @@ class DraftModelSpeculator(BaseSpeculator):
+         spec_step_idx: int = 0,
+         num_steps: int = 1,
+     ) -> torch.Tensor:
+-        if draft_logits is None and self.use_local_argmax_reduction:
++        if self.draft_vocab is not None:
++            sub_logits = self.draft_vocab.compute_logits(hidden_states)
++            if draft_logits is None and self.acceptance_estimator is None:
++                # Greedy: argmax over the subset, mapped to target ids.
++                return self.draft_vocab.to_target(greedy_argmax(sub_logits))
++            # Full-vocabulary row, -inf outside the subset: q is exactly the
++            # subset softmax and 0 elsewhere.
++            logits = self.draft_vocab.scatter(sub_logits)
++        elif draft_logits is None and self.use_local_argmax_reduction:
+             return self.get_draft_top_tokens(hidden_states, spec_step_idx)
+-
+-        logits = self.compute_draft_logits(hidden_states, spec_step_idx)
++        else:
++            logits = self.compute_draft_logits(hidden_states, spec_step_idx)
+         if draft_logits is not None and self.draft_watermarker is not None:
+             sampled = self.draft_watermarker.sample(
+                 logits,

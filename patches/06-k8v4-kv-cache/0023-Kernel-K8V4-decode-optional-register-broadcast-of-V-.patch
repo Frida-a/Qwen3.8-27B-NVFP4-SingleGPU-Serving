@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:55:31 -0800
+Subject: [PATCH] [Kernel] K8V4 decode: optional register broadcast of V block
+ scales
+
+VLLM_K8V4_SCALE_BCAST=1 loads [BLOCK_N, D/16] scales once and broadcasts
+them in registers instead of 16x-redundant expanded loads (A/B knob).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/ops/k8v4_kv.py | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/v1/attention/ops/k8v4_kv.py b/vllm/v1/attention/ops/k8v4_kv.py
+index 55f55594a..4d1443e9a 100644
+--- a/vllm/v1/attention/ops/k8v4_kv.py
++++ b/vllm/v1/attention/ops/k8v4_kv.py
+@@ -259,6 +259,7 @@ def _k8v4_decode_stage1(
+     BLOCK_M: tl.constexpr,
+     QLEN: tl.constexpr,
+     RAGGED: tl.constexpr,
++    SCALE_BCAST: tl.constexpr,
+ ):
+     HALF: tl.constexpr = HEAD_DIM // 2
+     b = tl.program_id(0)
+@@ -327,12 +328,21 @@ def _k8v4_decode_stage1(
+             tl.int32
+         )
+         soff = (pbase + r * (HEAD_DIM // 16))[:, None]
+-        sc_lo = tl.load(vs_ptr + soff + sidx[None, :], mask=kv_ok[:, None], other=0)
+-        sc_hi = tl.load(
+-            vs_ptr + soff + (HALF // 16) + sidx[None, :], mask=kv_ok[:, None], other=0
+-        )
+-        sc_lo = sc_lo.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+-        sc_hi = sc_hi.to(tl.float8e4nv, bitcast=True).to(tl.float16)
++        if SCALE_BCAST:
++            # load [BLOCK_N, D/16] scales once, broadcast in registers
++            ds = tl.arange(0, HEAD_DIM // 16)
++            sc = tl.load(vs_ptr + soff + ds[None, :], mask=kv_ok[:, None], other=0)
++            sc = sc.to(tl.float8e4nv, bitcast=True).to(tl.float16)
++            sc_lo, sc_hi = tl.split(tl.permute(tl.reshape(sc, [BLOCK_N, 2, HALF // 16]), (0, 2, 1)))
++            sc_lo = tl.reshape(tl.broadcast_to(sc_lo[:, :, None], [BLOCK_N, HALF // 16, 16]), [BLOCK_N, HALF])
++            sc_hi = tl.reshape(tl.broadcast_to(sc_hi[:, :, None], [BLOCK_N, HALF // 16, 16]), [BLOCK_N, HALF])
++        else:
++            sc_lo = tl.load(vs_ptr + soff + sidx[None, :], mask=kv_ok[:, None], other=0)
++            sc_hi = tl.load(
++                vs_ptr + soff + (HALF // 16) + sidx[None, :], mask=kv_ok[:, None], other=0
++            )
++            sc_lo = sc_lo.to(tl.float8e4nv, bitcast=True).to(tl.float16)
++            sc_hi = sc_hi.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+         v_lo = _e2m1_f16_scaled(vd & 15) * sc_lo
+         v_hi = _e2m1_f16_scaled(vd >> 4) * sc_hi
+         acc_lo = acc_lo * alpha[:, None] + tl.dot(p16, v_lo)
+@@ -495,6 +505,7 @@ def k8v4_decode(
+         BLOCK_M=block_m,
+         QLEN=q_len_per_req,
+         RAGGED=ragged,
++        SCALE_BCAST=os.environ.get("VLLM_K8V4_SCALE_BCAST", "0") == "1",
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )

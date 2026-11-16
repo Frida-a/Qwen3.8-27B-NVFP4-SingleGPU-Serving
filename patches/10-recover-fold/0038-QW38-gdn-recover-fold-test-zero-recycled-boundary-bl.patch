@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 15:49:34 -0800
+Subject: [PATCH] [QW38] gdn recover fold test: zero recycled boundary blocks
+ in both paths
+
+A block recycled from a finished request holds stale state that legitimately
+differs between eager and deferred commit (the last records of a finished
+request are never folded); nothing reads it before a boundary store. The
+align-mode boundary check compared that stale content (7/8 align cases).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/mamba/test_gdn_recover_fold.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_fold.py b/tests/kernels/mamba/test_gdn_recover_fold.py
+index 6566ca494..f778066e4 100644
+--- a/tests/kernels/mamba/test_gdn_recover_fold.py
++++ b/tests/kernels/mamba/test_gdn_recover_fold.py
+@@ -167,6 +167,12 @@ class _Sim:
+                 b = self.rng.choice(self.free_slots)
+                 self.free_slots.remove(b)
+                 r.blocks.append(b)
++                # A recycled block holds stale content, which legitimately
++                # differs between the paths (a finished request's last
++                # records are never folded); nothing reads it before a
++                # boundary store, so start both copies from the same bits.
++                for s in self.ref_states + self.fold_states + (self.prev_ref or []):
++                    s[b].zero_()
+ 
+     # ---- graph mode ------------------------------------------------------------
+     def _init_graph(self):

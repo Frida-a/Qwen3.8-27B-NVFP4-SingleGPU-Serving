@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:45:29 -0800
+Subject: [PATCH] [Kernel] K8V4 tests: bound bf16 P rounding by sum p|v|
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/attention/test_k8v4_kv.py | 24 +++++++++++++++---------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/tests/kernels/attention/test_k8v4_kv.py b/tests/kernels/attention/test_k8v4_kv.py
+index d4af8fcfc..245ed3ba0 100644
+--- a/tests/kernels/attention/test_k8v4_kv.py
++++ b/tests/kernels/attention/test_k8v4_kv.py
+@@ -78,8 +78,9 @@ def test_store_matches_emulation(page, scales):
+ 
+ 
+ def _ref_attention(q, kf, vf, block_tables, seq_lens, q_starts, q_lens, scale):
+-    """FP32 reference on decoded K/V; returns [T, Hq, D]."""
++    """FP32 reference on decoded K/V; returns ([T, Hq, D] output, sum_n p|v|)."""
+     out = torch.zeros(q.shape, dtype=torch.float32, device=DEV)
++    mag = torch.zeros(q.shape, dtype=torch.float32, device=DEV)
+     page = kf.shape[2]
+     for b in range(block_tables.shape[0]):
+         s, ql, q0 = int(seq_lens[b]), int(q_lens[b]), int(q_starts[b])
+@@ -98,7 +99,8 @@ def _ref_attention(q, kf, vf, block_tables, seq_lens, q_starts, q_lens, scale):
+         p = torch.softmax(sc, dim=-1)
+         o = torch.einsum("thgn,hnd->thgd", p, vv)
+         out[q0:q0 + ql] = o.reshape(ql, HKV * GROUP, D)
+-    return out
++        mag[q0:q0 + ql] = torch.einsum("thgn,hnd->thgd", p, vv.abs()).reshape(ql, HKV * GROUP, D)
++    return out, mag
+ 
+ 
+ def _setup_decode(seq_lens_list, q_lens_list, page, seed=1):
+@@ -126,10 +128,14 @@ def _setup_decode(seq_lens_list, q_lens_list, page, seed=1):
+     return cache, bt, seq_lens, q_lens, q_cu, q
+ 
+ 
+-def _check(out, ref):
+-    # bf16 output rounding: elementwise atol + rtol (2 bf16 ulps), plus rel-L2
++def _check(out, ref, mag=None):
++    # bf16 output rounding (2 ulps) + bf16 P rounding (2^-9 relative per weight,
++    # bounded by 4e-3 * sum p|v|), plus a rel-L2 bound
+     diff = (out.float() - ref).abs()
+-    bad = diff > 2e-2 + 1.6e-2 * ref.abs()
++    tol = 2e-2 + 1.6e-2 * ref.abs()
++    if mag is not None:
++        tol = tol + 4e-3 * mag
++    bad = diff > tol
+     rel = ((out.float() - ref).norm() / ref.norm().clamp_min(1e-6)).item()
+     assert not bad.any() and rel < 6e-3, (diff.max().item(), int(bad.sum()), rel)
+ 
+@@ -151,9 +157,9 @@ def test_decode_uniform(page, qlen, splits):
+     k8v4_decode(q, cache, bt, sl, out, scale, q_len_per_req=qlen, num_splits=splits)
+     kf, vf = k8v4_read_cache_ref(cache, D)
+     starts = torch.arange(len(seqs)) * qlen
+-    ref = _ref_attention(q, kf, vf, bt, sl, starts, torch.tensor(qls), scale)
++    ref, mag = _ref_attention(q, kf, vf, bt, sl, starts, torch.tensor(qls), scale)
+     real = torch.tensor([s > 0 for s in seqs]).repeat_interleave(qlen).to(DEV)
+-    _check(out[real], ref[real])
++    _check(out[real], ref[real], mag[real])
+     assert torch.all(out[~real] == 0)
+ 
+ 
+@@ -167,8 +173,8 @@ def test_decode_ragged(splits):
+     k8v4_decode(q, cache, bt, sl, out, scale, q_len_per_req=4, q_cu_seq_lens=qcu,
+                 num_splits=splits)
+     kf, vf = k8v4_read_cache_ref(cache, D)
+-    ref = _ref_attention(q, kf, vf, bt, sl, qcu[:-1], ql, scale)
+-    _check(out, ref)
++    ref, mag = _ref_attention(q, kf, vf, bt, sl, qcu[:-1], ql, scale)
++    _check(out, ref, mag)
+ 
+ 
+ def test_decode_matches_emulated_bf16_cache():

@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:40:30 -0800
+Subject: [PATCH] [QW38] KV grouping: avoid padding full-attention buckets
+ (DFlash2 draft SWA bucket of 5 forced group size 5 -> 16 full layers padded
+ to 20, -20% KV tokens)
+
+Off-switch VLLM_KV_GROUP_FULL_PAD_FIX=0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/core/kv_cache_planning.py | 55 +++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/vllm/v1/core/kv_cache_planning.py b/vllm/v1/core/kv_cache_planning.py
+index 92d521313..d5f67ccca 100644
+--- a/vllm/v1/core/kv_cache_planning.py
++++ b/vllm/v1/core/kv_cache_planning.py
+@@ -3,6 +3,7 @@
+ """KV cache planning: grouping, sizing, and memory-fit logic."""
+ 
+ import math
++import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Sequence
+ from dataclasses import replace
+@@ -556,6 +557,9 @@ def _get_kv_cache_groups_uniform_page_size(
+         # layers while accommodating speculative decoding drafters that add
+         # extra layers to one attention type.
+         group_size = max_num_layers
++    group_size = _min_full_attention_padding_group_size(
++        layer_buckets, spec_buckets, group_size
++    )
+     grouped_layers = []
+     for layers in layer_buckets:
+         num_padding_layers = group_size - len(layers) % group_size
+@@ -582,6 +586,57 @@ def _get_kv_cache_groups_uniform_page_size(
+     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+ 
+ 
++def _min_full_attention_padding_group_size(
++    layer_buckets: list[list[str]],
++    spec_buckets: list[list[KVCacheSpec]],
++    group_size: int,
++) -> int:
++    """QW38: pick a group size that does not pad full-attention buckets.
++
++    Every block of the shared pool spans `group_size` layer slots, so a padded
++    slot in a group is wasted for every block that group allocates. For a
++    full-attention group that is every block of every request (length
++    proportional), while sliding-window / chunked-local / mamba groups hold a
++    bounded number of blocks per request. The n:1 heuristic above picks the
++    smallest bucket as the group size; with a speculative drafter that adds a
++    small bucket of a different type (e.g. Qwen3.8 hybrid: 16 full + 48 mamba,
++    plus a DFlash2 draft with 5 sliding-window layers -> group size 5) the 16
++    full-attention layers are padded to 20 slots and each request walks 4 full
++    groups: -20% KV tokens. If the heuristic's choice pads a full-attention
++    bucket, use the group size with (least full-attention padding, fewest
++    groups, least total padding) instead; otherwise keep it unchanged.
++    Off-switch: VLLM_KV_GROUP_FULL_PAD_FIX=0.
++    """
++    if os.environ.get("VLLM_KV_GROUP_FULL_PAD_FIX", "1") == "0":
++        return group_size
++    sizes = [len(layers) for layers in layer_buckets]
++    is_full = [
++        isinstance(specs[0], FullAttentionSpec) for specs in spec_buckets
++    ]
++
++    def cost(gs: int) -> tuple[int, int, int]:
++        full_pad = sum(
++            cdiv(n, gs) * gs - n for n, f in zip(sizes, is_full) if f
++        )
++        n_groups = sum(cdiv(n, gs) for n in sizes)
++        total_pad = sum(cdiv(n, gs) * gs - n for n in sizes)
++        return full_pad, n_groups, total_pad
++
++    base = cost(group_size)
++    if base[0] == 0:
++        return group_size
++    best = min(range(1, max(sizes) + 1), key=lambda gs: (*cost(gs), -gs))
++    if cost(best)[0] < base[0]:
++        logger.info(
++            "KV cache grouping: group size %d -> %d (full-attention padding "
++            "%d -> %d layer slots; groups %d -> %d; bucket sizes %s)",
++            group_size, best, base[0], cost(best)[0], base[1],
++            cost(best)[1], sizes,
++        )
++        return best
++    return group_size
++
++
+ def _get_per_layer_spec(
+     group: KVCacheGroupSpec,
+     layer_name: str,

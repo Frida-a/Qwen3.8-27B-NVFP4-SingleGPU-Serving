@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:26:56 -0800
+Subject: [PATCH] [Attention] FlashInfer: SM120 FP8 prefill flag selects an HND
+ KV layout
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/backends/flashinfer.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 94c61b6a5..bf2cb441a 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -736,6 +736,13 @@ class FlashInferBackend(AttentionBackend):
+             # The trtllm-gen kernels consume head-major block interiors; the L/B
+             # nesting outside the block is immaterial to them.
+             return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
++        if (
++            capability is not None
++            and capability.major == 12
++            and os.environ.get("VLLM_FLASHINFER_SM120_FP8_PREFILL", "0") == "1"
++        ):
++            # The SM120 FP8 prefill FMHA (cute-dsl-prims) reads HND page pools.
++            return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
+         # FlashInfer addresses a layer's cache as NHD or HND pages, so it cannot
+         # consume LHBNC, which puts the head dim outside the block dim.
+         return get_flashinfer_kv_cache_layouts()

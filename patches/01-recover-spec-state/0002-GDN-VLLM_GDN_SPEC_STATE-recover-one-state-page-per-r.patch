@@ -1,0 +1,1023 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:27:11 -0800
+Subject: [PATCH] [GDN] VLLM_GDN_SPEC_STATE=recover: one state page per request
+ in spec decode
+
+Opt-in (env VLLM_GDN_SPEC_STATE=recover, default "per_token" = unchanged)
+integration of the records verify + commit for Qwen GDN layers:
+
+- Page layout: gated_delta_net_state_shape/_dtype append the record rings
+  (u fp32 [HV, R, V], k act-dtype [H, R, K], g fp32 [HV, R], R = num_spec + 2)
+  when enabled; all GDN model classes pass num_spec to the dtype calculator so
+  config-time and layer page sizes agree. Qwen GDN layers report
+  num_speculative_blocks = 0: one Mamba page per request instead of
+  1 + num_speculative_tokens.
+- Verify: _forward_core's spec branch calls gdn_recover_verify on q/k/v views
+  of the conv output (no rearrange copy) and writes spec-only outputs in
+  place; the fused CUDA MTP path is disabled in this mode (the gated RMSNorm
+  runs as the separate existing op).
+- Commit: GDNRecoverSpecMetadata (a RecoverSSMMetadata) carries the spec
+  rows' slots and batch rows; MambaHybridModelState's RecoverSSMState hook
+  folds the accepted records for every layer of the group in one launch from
+  postprocess_state, right after num_accepted is scattered.
+  update_block_table re-targets the commit to each group's layers/slots.
+- Guards: fp32 SSM state, mamba_cache_mode "none" (prefix caching / align
+  mode not supported yet), CUDA, PP = 1.
+
+Tests: builder metadata (CPU) and a model-path test running _forward_core +
+builder for several steps in both modes (bit-identical outputs, conv and
+accepted states).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mamba/test_gdn_recover_model_path.py      | 209 ++++++++++++++++++
+ .../v1/attention/test_gdn_recover_metadata.py | 116 ++++++++++
+ vllm/envs.py                                  |  15 ++
+ vllm/model_executor/layers/mamba/gdn/base.py  |   1 +
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  | 124 ++++++++++-
+ .../layers/mamba/mamba_utils.py               |  32 ++-
+ vllm/model_executor/models/minicpmv4_6.py     |   1 +
+ vllm/model_executor/models/olmo_hybrid.py     |   1 +
+ vllm/model_executor/models/qwen3_5.py         |   2 +
+ vllm/model_executor/models/qwen3_next.py      |   1 +
+ vllm/models/qwen3_5/nvidia/model.py           |   2 +
+ vllm/models/qwen4_exp/amd/model.py            |   1 +
+ vllm/models/qwen4_exp/nvidia/model.py         |   1 +
+ vllm/v1/attention/backends/gdn_attn.py        | 115 +++++++++-
+ .../worker/gpu/model_states/mamba_hybrid.py   |  12 +-
+ 15 files changed, 617 insertions(+), 16 deletions(-)
+ create mode 100644 tests/kernels/mamba/test_gdn_recover_model_path.py
+ create mode 100644 tests/v1/attention/test_gdn_recover_metadata.py
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_model_path.py b/tests/kernels/mamba/test_gdn_recover_model_path.py
+new file mode 100644
+index 000000000..4c5570c35
+--- /dev/null
++++ b/tests/kernels/mamba/test_gdn_recover_model_path.py
+@@ -0,0 +1,209 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Model path of VLLM_GDN_SPEC_STATE=recover vs the per-token Triton path.
++
++Runs QwenGatedDeltaNetAttention._forward_core with real GDN metadata for
++several speculative steps in both modes, committing the recover mode's
++records after each step as the model runner does. Outputs, convolution
++states and accepted recurrent states must be bit-identical.
++"""
++
++import os
++import types
++from unittest.mock import patch
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not current_platform.is_cuda():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++from tests.v1.attention.utils import (  # noqa: E402
++    BatchSpec,
++    create_common_attn_metadata,
++    create_vllm_config,
++)
++from vllm.config import SpeculativeConfig, set_current_vllm_config  # noqa: E402
++from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn  # noqa: E402
++from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa: E402
++    QwenGatedDeltaNetAttention,
++)
++from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
++    MambaStateShapeCalculator,
++)
++from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
++    GDNAttentionMetadataBuilder,
++    GDNRecoverSpecMetadata,
++)
++from vllm.v1.kv_cache_interface import MambaSpec  # noqa: E402
++
++NUM_SPEC = 3
++T = NUM_SPEC + 1
++H, HV, K, V = 2, 6, 128, 128
++CONV_KERNEL = 4
++CONV_DIM = 2 * H * K + HV * V
++BLOCK_SIZE = 16
++PREFIX = "model.layers.0.linear_attn"
++# Any Qwen3.5-family config works; override with a local path when offline.
++MODEL = os.environ.get("GDN_RECOVER_TEST_MODEL", "Qwen/Qwen3.5-0.8B")
++
++
++def _bits(x):
++    return x.view({4: torch.int32, 2: torch.int16}[x.element_size()])
++
++
++def _make_vllm_config():
++    config = create_vllm_config(
++        model_name=MODEL,
++        block_size=BLOCK_SIZE,
++        hf_config_override={"linear_key_head_dim": K},
++    )
++    config.additional_config = {"gdn_prefill_backend": "triton"}
++    config.cache_config.mamba_cache_mode = "none"
++    config.speculative_config = SpeculativeConfig(
++        method="ngram", num_speculative_tokens=NUM_SPEC
++    )
++    return config
++
++
++def _layer(vllm_config, kv_cache, params, recover):
++    a_log, dt_bias, conv_weight = params
++    layer = types.SimpleNamespace(
++        prefix=PREFIX,
++        enable_packed_recurrent_decode=False,
++        tp_size=1,
++        num_k_heads=H,
++        num_v_heads=HV,
++        head_k_dim=K,
++        head_v_dim=V,
++        key_dim=H * K,
++        value_dim=HV * V,
++        activation="silu",
++        A_log=a_log,
++        dt_bias=dt_bias,
++        conv1d=types.SimpleNamespace(weight=conv_weight, bias=None),
++        kv_cache=kv_cache,
++        num_spec=NUM_SPEC,
++        spec_recover=recover,
++        gdn_decode_kernel="triton",
++    )
++    for name in ("rearrange_mixed_qkv", "_forward_core", "_recover_spec_verify"):
++        setattr(
++            layer,
++            name,
++            types.MethodType(getattr(QwenGatedDeltaNetAttention, name), layer),
++        )
++    return layer
++
++
++@pytest.mark.parametrize("num_reqs", [1, 5])
++@torch.inference_mode()
++def test_recover_matches_per_token_path(monkeypatch, num_reqs):
++    torch.manual_seed(0)
++    dev = torch.device("cuda")
++    steps = 5
++    gen = torch.Generator().manual_seed(num_reqs)
++    conv_shape, ssm_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
++        1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
++    )[:2]
++    conv0 = 0.05 * torch.randn(num_reqs, *conv_shape, device=dev).to(torch.bfloat16)
++    ssm0 = 0.05 * torch.randn(num_reqs, *ssm_shape, device=dev)
++    params = (
++        torch.log(torch.rand(HV, device=dev) * 15 + 1),
++        0.1 * torch.randn(HV, device=dev),
++        0.3 * torch.randn(CONV_DIM, 1, CONV_KERNEL, device=dev).to(torch.bfloat16),
++    )
++    inputs = [
++        (
++            torch.randn(num_reqs * T, CONV_DIM, device=dev).to(torch.bfloat16),
++            torch.randn(num_reqs * T, 2 * HV, device=dev).to(torch.bfloat16),
++        )
++        for _ in range(steps)
++    ]
++    accepted = torch.randint(1, T + 1, (steps, num_reqs), generator=gen).to(torch.int32)
++
++    results = {}
++    for recover in (False, True):
++        monkeypatch.setenv("VLLM_GDN_SPEC_STATE", "recover" if recover else "per_token")
++        vllm_config = _make_vllm_config()
++        cols = 1 if recover else T
++        builder = GDNAttentionMetadataBuilder(
++            kv_cache_spec=MambaSpec(
++                block_size=BLOCK_SIZE,
++                shapes=((16, 64),),
++                dtypes=(torch.float16,),
++                num_speculative_blocks=cols - 1,
++            ),
++            layer_names=[PREFIX],
++            vllm_config=vllm_config,
++            device=dev,
++        )
++        assert builder.spec_recover == recover
++        num_slots = 1 + num_reqs * cols
++        table = 1 + torch.arange(num_reqs * cols, device=dev, dtype=torch.int32)
++        table = table.view(num_reqs, cols)
++        conv = torch.zeros(num_slots, *conv_shape, device=dev, dtype=torch.bfloat16)
++        ssm = torch.zeros(num_slots, *ssm_shape, device=dev)
++        conv[table[:, 0].long()] = conv0
++        ssm[table[:, 0].long()] = ssm0
++        kv_cache = (conv, ssm)
++        if recover:
++            shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
++                1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
++            )
++            assert len(shapes) == 5
++            kv_cache += (
++                torch.zeros(num_slots, *shapes[2], device=dev),
++                torch.zeros(num_slots, *shapes[3], device=dev, dtype=torch.bfloat16),
++                torch.zeros(num_slots, *shapes[4], device=dev),
++            )
++        layer = _layer(vllm_config, kv_cache, params, recover)
++        vllm_config.compilation_config.static_forward_context[PREFIX] = layer
++        outs = []
++        prev_acc = torch.ones(num_reqs, dtype=torch.int32, device=dev)
++        for s in range(steps):
++            batch = BatchSpec(
++                seq_lens=[64 + T * (s + 1)] * num_reqs, query_lens=[T] * num_reqs
++            )
++            common = create_common_attn_metadata(batch, BLOCK_SIZE, dev)
++            common = common.replace(block_table_tensor=table)
++            with set_current_vllm_config(vllm_config):
++                meta = builder.build(
++                    common_prefix_len=0,
++                    common_attn_metadata=common,
++                    num_accepted_tokens=prev_acc.clone(),
++                    num_decode_draft_tokens_cpu=torch.full(
++                        (num_reqs,), NUM_SPEC, dtype=torch.int32
++                    ),
++                )
++            assert isinstance(meta, GDNRecoverSpecMetadata) == recover
++            mixed_qkv, ba = inputs[s]
++            out = torch.zeros(num_reqs * T, HV, V, device=dev, dtype=torch.bfloat16)
++            context = types.SimpleNamespace(attn_metadata={PREFIX: meta})
++            with patch.object(
++                qwen_gdn_linear_attn, "get_forward_context", return_value=context
++            ):
++                layer._forward_core(
++                    mixed_qkv=mixed_qkv.clone(),
++                    b=ba[:, :HV],
++                    a=ba[:, HV:],
++                    core_attn_out=out,
++                )
++            outs.append(out)
++            acc = accepted[s].to(dev)
++            if recover:
++                meta.commit_recoverssm_state(acc)
++            prev_acc = acc
++        if recover:
++            final = ssm[table[:, 0].long()]
++        else:
++            final = ssm[table[torch.arange(num_reqs), prev_acc.long() - 1].long()]
++        results[recover] = (outs, conv[table[:, 0].long()].clone(), final.clone())
++
++    (o0, c0, s0), (o1, c1, s1) = results[False], results[True]
++    for s in range(steps):
++        assert torch.equal(_bits(o1[s]), _bits(o0[s])), f"output step {s}"
++    assert torch.equal(_bits(c1), _bits(c0)), "conv state"
++    assert torch.equal(_bits(s1), _bits(s0)), "accepted ssm state"
+diff --git a/tests/v1/attention/test_gdn_recover_metadata.py b/tests/v1/attention/test_gdn_recover_metadata.py
+new file mode 100644
+index 000000000..ccd7b67ea
+--- /dev/null
++++ b/tests/v1/attention/test_gdn_recover_metadata.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN metadata under VLLM_GDN_SPEC_STATE=recover: one state slot per
++request, and the commit after sampling gets the spec rows' slots, query
++boundaries and batch rows."""
++
++import pytest
++import torch
++
++from tests.v1.attention.test_gdn_metadata_builder import (
++    _build,
++    _create_gdn_builder,
++)
++from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
++from vllm.v1.attention.backends.gdn_attn import (
++    GDNAttentionMetadata,
++    GDNRecoverSpecMetadata,
++)
++
++BLOCK_SIZE = 16
++DEVICE = torch.device("cpu")
++NUM_SPEC = 3
++
++
++@pytest.fixture
++def recover_env(monkeypatch):
++    monkeypatch.setenv("VLLM_GDN_SPEC_STATE", "recover")
++
++
++class _FakeGroup:
++    def __init__(self):
++        self.calls = []
++
++    def commit(self, slots, cu, num_accepted, row_indices=None):
++        self.calls.append((slots.clone(), cu.clone(), num_accepted, row_indices))
++
++
++@pytest.mark.parametrize("full_cuda_graph", [False, True])
++def test_pure_spec_batch(recover_env, full_cuda_graph):
++    builder = _create_gdn_builder(NUM_SPEC, full_cuda_graph)
++    assert builder.spec_recover
++    batch = BatchSpec(seq_lens=[80, 96, 40], query_lens=[4, 2, 4])
++    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
++    meta = _build(builder, batch, [3, 1, 3], common.block_table_tensor)
++    assert isinstance(meta, GDNRecoverSpecMetadata)
++    assert meta.num_spec_decodes == 3
++    assert meta.spec_state_indices_tensor.shape[1] == 1
++    torch.testing.assert_close(
++        meta.recover_slot_indices, common.block_table_tensor[:3, 0]
++    )
++    assert meta.recover_row_indices is None
++    assert meta.recover_builder is builder
++
++    fake = _FakeGroup()
++    builder.recover_commit_group = lambda: fake
++    num_sampled = torch.tensor([2, 1, 4], dtype=torch.int32)
++    assert meta.commit_recoverssm_state(num_sampled) is None
++    (slots, cu, acc, rows), *rest = fake.calls
++    assert not rest
++    torch.testing.assert_close(slots, common.block_table_tensor[:3, 0])
++    torch.testing.assert_close(cu, torch.tensor([0, 4, 6, 10], dtype=cu.dtype))
++    assert acc is num_sampled and rows is None
++
++
++def test_mixed_batch_maps_spec_rows(recover_env):
++    builder = _create_gdn_builder(NUM_SPEC)
++    batch = BatchSpec(seq_lens=[100, 65, 20, 30], query_lens=[50, 1, 3, 4])
++    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
++    meta = _build(builder, batch, [-1, -1, 2, 3], common.block_table_tensor)
++    assert isinstance(meta, GDNRecoverSpecMetadata)
++    assert meta.num_spec_decodes == 2 and meta.num_prefills == 2
++    torch.testing.assert_close(
++        meta.recover_slot_indices, common.block_table_tensor[2:4, 0]
++    )
++    torch.testing.assert_close(
++        meta.recover_row_indices, torch.tensor([2, 3], dtype=torch.int32)
++    )
++    # Prefill rows read and write the same (single) slot column.
++    torch.testing.assert_close(
++        meta.prefill_state_indices, common.block_table_tensor[:2, 0]
++    )
++
++
++def test_no_spec_rows_commits_nothing(recover_env):
++    builder = _create_gdn_builder(NUM_SPEC)
++    batch = BatchSpec(seq_lens=[100, 65], query_lens=[50, 20])
++    meta = _build(builder, batch, [-1, -1])
++    assert isinstance(meta, GDNRecoverSpecMetadata)
++    assert meta.num_spec_decodes == 0 and meta.recover_slot_indices is None
++    builder.recover_commit_group = lambda: pytest.fail("no commit expected")
++    assert meta.commit_recoverssm_state(torch.ones(2, dtype=torch.int32)) is None
++
++
++@pytest.mark.parametrize("full_cuda_graph", [False, True])
++def test_update_block_table_uses_own_group(recover_env, full_cuda_graph):
++    src, dst = (_create_gdn_builder(NUM_SPEC, full_cuda_graph) for _ in range(2))
++    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 4])
++    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
++    meta = _build(src, batch, [3, 3], common.block_table_tensor)
++    other_table = common.block_table_tensor + 100
++    meta2 = dst.update_block_table(meta, other_table, common.slot_mapping)
++    assert isinstance(meta2, GDNRecoverSpecMetadata)
++    assert meta2.recover_builder is dst and meta.recover_builder is src
++    torch.testing.assert_close(meta2.recover_slot_indices, other_table[:2, 0])
++    torch.testing.assert_close(
++        meta.recover_slot_indices, common.block_table_tensor[:2, 0]
++    )
++
++
++def test_default_mode_unchanged():
++    builder = _create_gdn_builder(NUM_SPEC)
++    assert not builder.spec_recover
++    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 4])
++    meta = _build(builder, batch, [3, 3])
++    assert type(meta) is GDNAttentionMetadata
++    assert meta.spec_state_indices_tensor.shape[1] == NUM_SPEC + 1
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 2b701409d..1ee21d08f 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -135,6 +135,7 @@ if TYPE_CHECKING:
+     VLLM_USE_HW_AGNOSTIC: bool = False
+     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
++    VLLM_GDN_SPEC_STATE: Literal["per_token", "recover"] = "per_token"
+     VLLM_DISABLE_PYNCCL: bool = False
+     VLLM_USE_OINK_OPS: bool = False
+     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
+@@ -1305,6 +1306,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         ["cuda", "triton"],
+         case_sensitive=False,
+     ),
++    # GDN recurrent state under speculative decoding (Qwen GDN layers).
++    # "per_token": the verify stores the state after every draft token, one
++    # Mamba page per draft position (1 + num_speculative_tokens per request).
++    # "recover": one page per request; the verify writes small per-token
++    # records into a ring in that page and a commit after sampling folds the
++    # accepted ones into the state (Triton; bit-identical to the Triton
++    # per-token path). Requires mamba_cache_mode "none" (no prefix caching)
++    # and an fp32 SSM state.
++    "VLLM_GDN_SPEC_STATE": env_with_choices(
++        "VLLM_GDN_SPEC_STATE",
++        "per_token",
++        ["per_token", "recover"],
++        case_sensitive=False,
++    ),
+     # Disable pynccl (using torch.distributed instead)
+     "VLLM_DISABLE_PYNCCL": lambda: (
+         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+diff --git a/vllm/model_executor/layers/mamba/gdn/base.py b/vllm/model_executor/layers/mamba/gdn/base.py
+index 249d56685..370f71caf 100644
+--- a/vllm/model_executor/layers/mamba/gdn/base.py
++++ b/vllm/model_executor/layers/mamba/gdn/base.py
+@@ -55,4 +55,5 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+             self.model_config.dtype,
+             self.cache_config.mamba_cache_dtype,
+             self.cache_config.mamba_ssm_cache_dtype,
++            num_spec=self.num_spec,
+         )
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 77c284449..14fde4261 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -47,6 +47,7 @@ from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+ from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateShapeCalculator,
++    gdn_spec_recover_enabled,
+     is_conv_state_dim_first,
+ )
+ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+@@ -56,6 +57,10 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+     gather_initial_states,
+ )
++from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++    GDNRecoverRecords,
++    gdn_recover_verify,
++)
+ from vllm.model_executor.layers.mamba.ops.hip_gdn_chunk import (
+     chunk_gdn_hip_fwd,
+     is_hip_gdn_available,
+@@ -866,6 +871,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # returns the out_proj input: `out`, or a pre-quantized activation.
+         self._fused_gdn_gated_rms_norm = fused_gdn_gated_rms_norm
+         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
++        # VLLM_GDN_SPEC_STATE=recover: one state page per request, verify
++        # records + commit instead of per-draft-token states (Triton only).
++        self.spec_recover = gdn_spec_recover_enabled(self.num_spec)
++        if self.spec_recover:
++            reason = self._spec_recover_unsupported_reason(vllm_config)
++            if reason is not None:
++                raise ValueError(f"VLLM_GDN_SPEC_STATE=recover: {reason}")
++            if self.gdn_decode_kernel == "cuda":
++                logger.info_once(
++                    "VLLM_GDN_SPEC_STATE=recover uses the Triton GDN verify "
++                    "(records + commit); the fused CUDA MTP kernel is disabled."
++                )
++            self.gdn_decode_kernel = "triton"
+         if self.gdn_decode_kernel == "cuda" and current_platform.is_cuda_alike():
+             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
+             if reason is not None:
+@@ -898,8 +916,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+     def get_prefill_checkpoint_alignment(self) -> int | None:
+         return self._checkpoint_alignment
+ 
++    def _spec_recover_unsupported_reason(self, vllm_config: VllmConfig) -> str | None:
++        _, ssm_dtype = self.get_state_dtype()[:2]
++        if vllm_config.cache_config.mamba_cache_mode != "none":
++            return (
++                "prefix caching (mamba_cache_mode='align') is not supported yet; "
++                "pass --no-enable-prefix-caching"
++            )
++        if ssm_dtype != torch.float32:
++            return f"only an fp32 SSM state is supported (got {ssm_dtype})"
++        if not current_platform.is_cuda():
++            return "only CUDA is supported"
++        if vllm_config.parallel_config.pipeline_parallel_size > 1:
++            return "pipeline parallelism is not supported"
++        if self.num_v_heads % self.num_k_heads != 0:
++            return "num_v_heads must be a multiple of num_k_heads"
++        return None
++
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+         spec = super().get_kv_cache_spec(vllm_config)
++        if self.spec_recover and isinstance(spec, MambaSpec):
++            # The verify never writes per-draft-token states.
++            spec = replace(spec, num_speculative_blocks=0)
+         if not self._exports_checkpoints or not isinstance(spec, MambaSpec):
+             return spec
+         # FlashInfer emits states at one stride for the whole batch, the gcd of
+@@ -941,7 +979,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+     def _fused_gdn_decode_unsupported_reason(
+         self, vllm_config: VllmConfig
+     ) -> str | None:
+-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
++        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
+         if (
+             self.gqa_interleaved_layout
+             or self.head_k_dim != 128
+@@ -1550,7 +1588,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         dtype = qkv_or_qkvz.dtype
+         num_k_heads = self.num_k_heads // self.tp_size
+         num_v_heads = self.num_v_heads // self.tp_size
+-        _, state_dtype = self.get_state_dtype()
++        state_dtype = self.get_state_dtype()[1]
+ 
+         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
+         # is sufficient to populate every autotuner cache. Mirror the real
+@@ -1826,6 +1864,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         ssm_state = self_kv_cache[1]
+         num_actual_tokens = attn_metadata.num_actual_tokens
+         num_accepted_tokens = attn_metadata.num_accepted_tokens
++        spec_recover = getattr(self, "spec_recover", False)
+ 
+         mixed_qkv = mixed_qkv[:num_actual_tokens]
+         b = b[:num_actual_tokens]
+@@ -1866,7 +1905,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 ],
+                 num_accepted_tokens=num_accepted_tokens,
+                 query_start_loc=spec_query_start_loc,
+-                max_query_len=spec_state_indices_tensor.size(-1),
++                # Recover mode keeps one state column per request.
++                max_query_len=(
++                    self.num_spec + 1
++                    if spec_recover
++                    else spec_state_indices_tensor.size(-1)
++                ),
+                 validate_data=False,
+             )
+ 
+@@ -1904,7 +1948,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         else:
+             mixed_qkv_non_spec = None
+ 
+-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
++        if spec_recover:
++            # The records verify reads q/k/v straight from the conv output.
++            query_spec = key_spec = value_spec = None
++        else:
++            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
++                mixed_qkv_spec
++            )
+ 
+         # Split mixed non-spec-decode+prefill to process independently
+         split_non_spec = (
+@@ -1967,7 +2017,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # 2. Recurrent attention
+ 
+         # 2.1: Process the multi-query part
+-        if spec_sequence_masks is not None:
++        if spec_sequence_masks is not None and spec_recover:
++            assert mixed_qkv_spec is not None
++            core_attn_out_spec = self._recover_spec_verify(
++                mixed_qkv_spec,
++                a_spec,
++                b_spec,
++                spec_state_indices_tensor,
++                spec_query_start_loc,
++                attn_metadata,
++                # A spec-only batch writes straight into the output buffer.
++                out=(
++                    core_attn_out[:num_actual_tokens].unsqueeze(0)
++                    if attn_metadata.num_prefills == 0
++                    and attn_metadata.num_decodes == 0
++                    else None
++                ),
++            )
++            last_recurrent_state = None
++        elif spec_sequence_masks is not None:
+             core_attn_out_spec, last_recurrent_state = (
+                 fused_sigmoid_gating_delta_rule_update(
+                     A_log=self.A_log,
+@@ -2110,10 +2178,54 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
+             )
+         elif spec_sequence_masks is not None:
+-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
++            dst = core_attn_out[:num_actual_tokens]
++            if core_attn_out_spec.data_ptr() != dst.data_ptr():
++                dst.copy_(core_attn_out_spec.squeeze(0))
+         elif not prefill_in_place:
+             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+ 
++    def _recover_spec_verify(
++        self,
++        mixed_qkv_spec: torch.Tensor,
++        a_spec: torch.Tensor,
++        b_spec: torch.Tensor,
++        spec_state_indices: torch.Tensor,
++        spec_query_start_loc: torch.Tensor,
++        attn_metadata: GDNAttentionMetadata,
++        out: torch.Tensor | None,
++    ) -> torch.Tensor:
++        """Verify the spec rows off their checkpoints, writing records (no
++        per-token states). The commit after sampling folds the accepted ones
++        (GDNAttentionMetadata.commit_recoverssm_state)."""
++        num_tokens = mixed_qkv_spec.shape[0]
++        num_k_heads = self.num_k_heads // self.tp_size
++        num_v_heads = self.num_v_heads // self.tp_size
++        q_dim = num_k_heads * self.head_k_dim
++        q, k, v = torch.split(
++            mixed_qkv_spec, [q_dim, q_dim, num_v_heads * self.head_v_dim], dim=-1
++        )
++        if out is None:
++            out = mixed_qkv_spec.new_empty(
++                (1, num_tokens, num_v_heads, self.head_v_dim)
++            )
++        _, ssm_state, rec_u, rec_k, rec_g = self.kv_cache
++        gdn_recover_verify(
++            q.view(num_tokens, num_k_heads, self.head_k_dim),
++            k.view(num_tokens, num_k_heads, self.head_k_dim),
++            v.view(num_tokens, num_v_heads, self.head_v_dim),
++            a_spec,
++            b_spec,
++            self.A_log,
++            self.dt_bias,
++            ssm_state,
++            GDNRecoverRecords(rec_u, rec_k, rec_g),
++            cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
++            slot_indices=spec_state_indices[:, 0],
++            out=out[0],
++            scale=self.head_k_dim**-0.5,
++        )
++        return out
++
+     def _forward_flashinfer_prefill(
+         self,
+         q: torch.Tensor,
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 956ccf21f..23bce19e9 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -58,6 +58,12 @@ def is_conv_state_dim_first() -> bool:
+     return get_conv_state_layout() == "DS"
+ 
+ 
++def gdn_spec_recover_enabled(num_spec: int) -> bool:
++    """GDN spec decode keeps one state page per request plus a record ring
++    (VLLM_GDN_SPEC_STATE=recover) instead of one page per draft position."""
++    return num_spec > 0 and envs.VLLM_GDN_SPEC_STATE.lower() == "recover"
++
++
+ class MambaStateDtypeCalculator:
+     @classmethod
+     def linear_attention_state_dtype(
+@@ -132,10 +138,16 @@ class MambaStateDtypeCalculator:
+         model_dtype: ModelDType | torch.dtype,
+         mamba_cache_dtype: MambaDType,
+         mamba_ssm_cache_dtype: MambaDType = "auto",
+-    ) -> tuple[torch.dtype, torch.dtype]:
+-        return cls._mamba_state_dtype(
++        num_spec: int = 0,
++    ) -> tuple[torch.dtype, ...]:
++        dtypes = cls._mamba_state_dtype(
+             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+         )
++        if gdn_spec_recover_enabled(num_spec):
++            # Record rings (u, k, g): fp32, activation dtype, fp32.
++            activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
++            dtypes = (*dtypes, torch.float32, activation_dtype, torch.float32)
++        return dtypes
+ 
+     @classmethod
+     def kda_state_dtype(
+@@ -298,6 +310,22 @@ class MambaStateShapeCalculator:
+             head_v_dim,
+             head_k_dim,
+         )
++        if gdn_spec_recover_enabled(num_spec):
++            from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++                gdn_recover_ring_shapes,
++            )
++
++            return (
++                conv_state_shape,
++                temporal_state_shape,
++                *gdn_recover_ring_shapes(
++                    divide(num_k_heads, tp_world_size),
++                    divide(num_v_heads, tp_world_size),
++                    head_k_dim,
++                    head_v_dim,
++                    num_spec,
++                ),
++            )
+         return conv_state_shape, temporal_state_shape
+ 
+     @classmethod
+diff --git a/vllm/model_executor/models/minicpmv4_6.py b/vllm/model_executor/models/minicpmv4_6.py
+index 58cf3a310..f51cb645e 100644
+--- a/vllm/model_executor/models/minicpmv4_6.py
++++ b/vllm/model_executor/models/minicpmv4_6.py
+@@ -1538,6 +1538,7 @@ class MiniCPMV4_6ForConditionalGeneration(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+diff --git a/vllm/model_executor/models/olmo_hybrid.py b/vllm/model_executor/models/olmo_hybrid.py
+index e32087ea2..ae9b02ce5 100644
+--- a/vllm/model_executor/models/olmo_hybrid.py
++++ b/vllm/model_executor/models/olmo_hybrid.py
+@@ -447,6 +447,7 @@ class OlmoHybridForCausalLM(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index 4a6e2ec43..b45d50692 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -391,6 +391,7 @@ class Qwen3_5ForCausalLMBase(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+@@ -612,6 +613,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 720e2f805..c09d1ec1b 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -912,6 +912,7 @@ class Qwen3NextForCausalLM(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+diff --git a/vllm/models/qwen3_5/nvidia/model.py b/vllm/models/qwen3_5/nvidia/model.py
+index 26eff345d..9ab576d09 100644
+--- a/vllm/models/qwen3_5/nvidia/model.py
++++ b/vllm/models/qwen3_5/nvidia/model.py
+@@ -738,6 +738,7 @@ class Qwen3_5ForCausalLMBase(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+@@ -942,6 +943,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+diff --git a/vllm/models/qwen4_exp/amd/model.py b/vllm/models/qwen4_exp/amd/model.py
+index 57bea4917..707849595 100644
+--- a/vllm/models/qwen4_exp/amd/model.py
++++ b/vllm/models/qwen4_exp/amd/model.py
+@@ -771,6 +771,7 @@ class Qwen4ExpForCausalLM(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index f705c9c76..91d5923b0 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -849,6 +849,7 @@ class Qwen4ExpForCausalLM(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+             vllm_config.cache_config.mamba_ssm_cache_dtype,
++            num_spec=vllm_config.num_speculative_tokens,
+         )
+ 
+     @classmethod
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index adc401f73..4c2cdbfcf 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -22,6 +22,10 @@ from vllm.v1.attention.backend import (
+     CommonAttentionMetadata,
+     max_decode_query_len,
+ )
++from vllm.v1.attention.backends.recoverssm_metadata import (
++    RecoverSSMMetadata,
++    RecoverSSMPostprocessMetadata,
++)
+ from vllm.v1.attention.backends.utils import (
+     NULL_BLOCK_ID,
+     compute_causal_conv1d_metadata,
+@@ -136,6 +140,37 @@ class GDNAttentionMetadata:
+     token_chunk_offset_ptr: torch.Tensor | None = None
+ 
+ 
++@dataclass
++class GDNRecoverSpecMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
++    """GDN metadata under VLLM_GDN_SPEC_STATE=recover: the verify wrote
++    records for the spec rows; the commit after sampling folds the accepted
++    ones into each request's single state slot."""
++
++    # Spec row -> state slot, and spec row -> batch row (None: spec rows are
++    # the leading batch rows).
++    recover_slot_indices: torch.Tensor | None = None
++    recover_row_indices: torch.Tensor | None = None
++    recover_builder: "GDNAttentionMetadataBuilder | None" = None
++
++    def commit_recoverssm_state(
++        self, num_accepted_tokens: torch.Tensor
++    ) -> RecoverSSMPostprocessMetadata | None:
++        if (
++            self.num_spec_decodes == 0
++            or self.recover_slot_indices is None
++            or self.recover_builder is None
++        ):
++            return None
++        assert self.spec_query_start_loc is not None
++        self.recover_builder.recover_commit_group().commit(
++            self.recover_slot_indices,
++            self.spec_query_start_loc[: self.num_spec_decodes + 1],
++            num_accepted_tokens,
++            row_indices=self.recover_row_indices,
++        )
++        return None
++
++
+ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
+     kv_cache_spec: MambaSpec
+     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+@@ -193,6 +228,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             self.num_spec = 0
+         self.use_spec_decode: bool = self.num_spec > 0
+         self._init_reorder_batch_threshold(1, self.use_spec_decode)
++        # VLLM_GDN_SPEC_STATE=recover: the layers keep one state slot per
++        # request (num_speculative_blocks == 0) and verify with records.
++        from vllm.model_executor.layers.mamba.mamba_utils import (
++            gdn_spec_recover_enabled,
++        )
++
++        self.spec_recover = (
++            type(self) is GDNAttentionMetadataBuilder
++            and gdn_spec_recover_enabled(self.num_spec)
++            and kv_cache_spec.num_speculative_blocks == 0
++        )
++        self._spec_state_cols = 1 if self.spec_recover else self.num_spec + 1
++        self._recover_group = None
++        self._recover_group_key: tuple[int, ...] | None = None
+ 
+         self.use_full_cuda_graph: bool = (
+             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+@@ -218,7 +267,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             )
+ 
+         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
+-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
++            (self.decode_cudagraph_max_bs, self._spec_state_cols),
+             dtype=torch.int32,
+             device=device,
+         )
+@@ -461,7 +510,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 # Padded sequences trail the spec decodes, so slice them off
+                 # rather than gather with the host mask (an H2D copy + a kernel).
+                 spec_state_indices_tensor = block_table_tensor[
+-                    :num_spec_decodes, : self.num_spec + 1
++                    :num_spec_decodes, : self._spec_state_cols
+                 ]
+                 non_spec_state_indices_tensor = None
+                 # Padded sequences are always at the back, so the first
+@@ -482,7 +531,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 spec_token_indx = index[num_non_spec_tokens:]
+ 
+                 spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
++                    spec_sequence_masks_cpu, : self._spec_state_cols
+                 ]
+                 non_spec_state_indices_tensor = block_table_tensor[
+                     non_spec_sequence_masks_cpu, 0
+@@ -686,7 +735,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
+             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+ 
+-        attn_metadata = GDNAttentionMetadata(
++        recover_kwargs = {}
++        metadata_cls: type[GDNAttentionMetadata] = GDNAttentionMetadata
++        if self.spec_recover:
++            metadata_cls = GDNRecoverSpecMetadata
++            recover_kwargs["recover_builder"] = self
++            if num_spec_decodes > 0:
++                assert spec_state_indices_tensor is not None
++                recover_kwargs["recover_slot_indices"] = spec_state_indices_tensor[
++                    :num_spec_decodes, 0
++                ]
++                if num_prefills > 0 or num_decodes > 0:
++                    assert spec_sequence_masks_cpu is not None
++                    recover_kwargs["recover_row_indices"] = async_tensor_h2d(
++                        spec_sequence_masks_cpu.nonzero().flatten(),
++                        device=query_start_loc.device,
++                        dtype=torch.int32,
++                    )
++        attn_metadata = metadata_cls(
++            **recover_kwargs,
+             num_prefills=num_prefills,
+             num_prefill_tokens=num_prefill_tokens,
+             num_decodes=num_decodes,
+@@ -771,9 +838,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 prefill_indices = non_spec_indices[m.num_decodes :]
+         elif m.num_prefills == 0:
+             # Same as build(): padded sequences trail the spec decodes.
+-            spec_indices = blk_table[: m.num_spec_decodes, : self.num_spec + 1]
++            spec_indices = blk_table[: m.num_spec_decodes, : self._spec_state_cols]
+         else:
+-            spec_indices = blk_table[masks, : self.num_spec + 1]
++            spec_indices = blk_table[masks, : self._spec_state_cols]
+             non_spec_indices = prefill_indices = blk_table[~masks, 0]
+ 
+         if self._stage_spec_decode(
+@@ -796,14 +863,50 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
+             non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
+ 
++        recover_kwargs = {}
++        if isinstance(m, GDNRecoverSpecMetadata):
++            # The commit folds into this group's layers and slots.
++            recover_kwargs["recover_builder"] = self
++            recover_kwargs["recover_slot_indices"] = (
++                spec_indices[: m.num_spec_decodes, 0]
++                if spec_indices is not None and m.num_spec_decodes > 0
++                else None
++            )
+         return replace(
+             m,
+             spec_state_indices_tensor=spec_indices,
+             non_spec_state_indices_tensor=non_spec_indices,
+             prefill_state_indices=prefill_indices,
+             checkpoint=checkpoint,
++            **recover_kwargs,
+         )
+ 
++    def recover_commit_group(self):
++        """The commit tables of this group's GDN layers (rebuilt if the KV
++        cache was rebound)."""
++        from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++            GDNRecoverCommitGroup,
++            GDNRecoverRecords,
++        )
++
++        ctx = self.vllm_config.compilation_config.static_forward_context
++        layers = [ctx[name] for name in self.layer_names]
++        key = tuple(layer.kv_cache[1].data_ptr() for layer in layers)
++        if self._recover_group is None or key != self._recover_group_key:
++            for layer in layers:
++                if not getattr(layer, "spec_recover", False):
++                    raise RuntimeError(
++                        f"{type(layer).__name__} does not support "
++                        "VLLM_GDN_SPEC_STATE=recover"
++                    )
++            self._recover_group = GDNRecoverCommitGroup(
++                states=[layer.kv_cache[1] for layer in layers],
++                records=[GDNRecoverRecords(*layer.kv_cache[2:5]) for layer in layers],
++                num_k_heads=layers[0].num_k_heads // layers[0].tp_size,
++            )
++            self._recover_group_key = key
++        return self._recover_group
++
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+     ):
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index c0205c7c0..e26b026df 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -9,7 +9,10 @@ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
++from vllm.model_executor.layers.mamba.mamba_utils import (
++    MambaStateCopyFuncsByType,
++    gdn_spec_recover_enabled,
++)
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+@@ -101,8 +104,13 @@ class MambaHybridModelState(DefaultModelState):
+             self._is_prefilling_gpu = torch.zeros(
+                 self.max_num_reqs, dtype=torch.bool, device=self.device
+             )
++        # KDA RecoverSSM, and GDN with VLLM_GDN_SPEC_STATE=recover: the verify
++        # leaves records that the commit after sampling folds into the state.
+         self.recoverssm = (
+-            RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
++            RecoverSSMState()
++            if self.cache_config.use_kda_recoverssm
++            or gdn_spec_recover_enabled(vllm_config.num_speculative_tokens)
++            else None
+         )
+         if self._align_mode or self._use_flashinfer_replayssm:
+             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None

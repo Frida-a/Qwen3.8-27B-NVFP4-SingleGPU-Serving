@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:42:23 -0800
+Subject: [PATCH] [GDN] int16 state store: single cvt.rni instead of rint +
+ clamp
+
+Bitwise-identical state and outputs (200-step B=64 packed decode A/B);
+packed decode B=256 199 -> 180 us, B=64 51 -> 46 us on GB300.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/model_executor/layers/mamba/ops/gdn_state_int16.py | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_state_int16.py b/vllm/model_executor/layers/mamba/ops/gdn_state_int16.py
+index 6ab793825..0a132a8cd 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_state_int16.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_state_int16.py
+@@ -67,8 +67,9 @@ def gdn_int16_store_state(
+     b_amax = tl.max(tl.where(mask_h, tl.abs(b_h), 0.0), axis=1)
+     b_scale = b_amax * (1.0 / 32767.0)
+     b_inv = tl.where(b_amax > 0, 32767.0 / b_amax, 0.0)
+-    b_q = tldevice.rint(b_h * b_inv[:, None])
+-    b_q = tl.minimum(tl.maximum(b_q, -32767.0), 32767.0)
++    # |x * inv| <= 32767 up to fp32 rounding (< 32767.01), so round-to-nearest-
++    # even in a single cvt.rni needs no clamp.
++    b_q = tldevice.float2int_rn(b_h * b_inv[:, None])
+     tl.store(
+         p_head + o_v[:, None] * K + o_k[None, :], b_q.to(tl.int16), mask=mask_h
+     )

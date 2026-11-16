@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:50:50 -0800
+Subject: [PATCH] [Kernel] K8V4 decode: FP16 exact dequant, split-half nibble
+ packing, multi-page tiles
+
+E2M1 codes shifted into FP16 bits are value * 2^-14, so V dequantizes with
+two integer ops and one FP16 multiply (exact for every E2M1 x E4M3 product);
+both GEMMs run in FP16 with FP32 accumulation. Byte j of a V row packs
+elements j and j + D/2, so the PV GEMM splits into two halves without an
+interleave. BLOCK_N may span several pages (per-row block ids).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/ops/k8v4_kv.py | 202 +++++++++++++++++--------------
+ 1 file changed, 111 insertions(+), 91 deletions(-)
+
+diff --git a/vllm/v1/attention/ops/k8v4_kv.py b/vllm/v1/attention/ops/k8v4_kv.py
+index f198b0f03..55f55594a 100644
+--- a/vllm/v1/attention/ops/k8v4_kv.py
++++ b/vllm/v1/attention/ops/k8v4_kv.py
+@@ -13,7 +13,7 @@ split into three planes (the layout must keep each page's [H, N, C] bytes
+ contiguous, i.e. an HND layout):
+ 
+     [ K   : H x P x D      fp8 e4m3 ]
+-    [ V   : H x P x D/2    uint8, two E2M1 codes per byte, low nibble first ]
++    [ V   : H x P x D/2    uint8, byte j = code[j] | code[j + D/2] << 4 ]
+     [ Vsf : H x P x D/16   fp8 e4m3 block scales ]
+ 
+ Numerics reproduce the QW38 accuracy emulation (FP8 keys, NVFP4 values):
+@@ -22,7 +22,11 @@ keys `fp8(clamp(k / k_scale, +-448))`; values per 16 elements of `x / g`:
+ E2M1 rounding `|y| < 2: rint(2|y|)/2; < 4: rint(|y|); < 5: 4; else 6`
+ (half-even, and 5.0 rounds up to 6 as in the emulation), dequant
+ `bf16((e2m1 * bs) * g)`. Dequantized values are exact in BF16 (<= 6
+-significant bits) when g == 1.
++significant bits) when g == 1. The decode kernel dequantizes in FP16, which
++is exact for every E2M1 x E4M3 product (an E2M1 code shifted into FP16 bits is
++the value times 2^-14; the 2^14 is applied to the FP32 accumulator), and runs
++both GEMMs in FP16 with FP32 accumulation (BF16 Q converts exactly for
++|q| >= 2^-14); the global scale g multiplies the output.
+ 
+ Kernels (Triton, no csrc):
+   * `k8v4_store`: reshape_and_cache writer (slot mapping).
+@@ -100,18 +104,29 @@ def _e2m1_to_f32(c):
+ 
+ 
+ @triton.jit
+-def _dequant_v_tile(vd, vsc, g, HEAD_DIM: tl.constexpr, ROWS: tl.constexpr):
+-    """[ROWS, D/2] packed codes (int32) + [ROWS, D/16] fp32 scales -> [ROWS, D]
+-    fp32 values `(e2m1 * bs) * g`."""
+-    lo = _e2m1_to_f32(vd & 15)
+-    hi = _e2m1_to_f32((vd >> 4) & 15)
+-    sc = tl.reshape(
+-        tl.broadcast_to(vsc[:, :, None], [ROWS, HEAD_DIM // 16, 8]),
+-        [ROWS, HEAD_DIM // 2],
+-    )
+-    lo = (lo * sc) * g
+-    hi = (hi * sc) * g
+-    return tl.reshape(tl.join(lo, hi), [ROWS, HEAD_DIM])
++def _e2m1_f16_scaled(c):
++    """E2M1 code (int32, 0..15) -> fp16 equal to value * 2^-14 (exact)."""
++    bits = ((c & 8) << 12) | ((c & 7) << 9)
++    return bits.to(tl.int16).to(tl.float16, bitcast=True)
++
++
++@triton.jit
++def _quant_nvfp4_half(b, HALF: tl.constexpr):
++    """[HALF] fp32 (already / g) -> (codes int32 [HALF], fp8 block scales [HALF/16])."""
++    b2 = tl.reshape(b, [HALF // 16, 16])
++    amax = tl.max(tl.abs(b2), axis=1)
++    bs = tl.minimum(tl.math.div_rn(amax, 6.0), 448.0).to(tl.float8e4nv)
++    bsf = bs.to(tl.float32)
++    safe = tl.where(bsf == 0.0, 1.0, bsf)
++    y = tl.clamp(tl.math.div_rn(b2, safe[:, None]), -6.0, 6.0)
++    a = tl.abs(y)
++    code = tl.where(
++        a < 2.0,
++        tldevice.rint(a * 2.0),
++        tl.where(a < 4.0, tldevice.rint(a) + 2.0, tl.where(a < 5.0, 6.0, 7.0)),
++    ).to(tl.int32)
++    code = code | tl.where(y < 0.0, 8, 0)
++    return tl.reshape(code, [HALF]), bs
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -156,30 +171,21 @@ def _k8v4_store_kernel(
+     k8 = tl.clamp(tl.math.div_rn(k, ks), -448.0, 448.0).to(tl.float8e4nv)
+     tl.store(k_ptr + page_base + row * HEAD_DIM + d, k8.to(tl.uint8, bitcast=True))
+ 
+-    # Values: NVFP4 per 16 elements (emulation-exact rounding).
+-    v = tl.load(value_ptr + t * stride_vt + h * stride_vh + d).to(tl.float32)
+-    b = tl.reshape(tl.math.div_rn(v, vg), [HEAD_DIM // 16, 16])
+-    amax = tl.max(tl.abs(b), axis=1)
+-    bs = tl.minimum(tl.math.div_rn(amax, 6.0), 448.0).to(tl.float8e4nv)
+-    bsf = bs.to(tl.float32)
+-    safe = tl.where(bsf == 0.0, 1.0, bsf)
+-    y = tl.clamp(tl.math.div_rn(b, safe[:, None]), -6.0, 6.0)
+-    a = tl.abs(y)
+-    code = tl.where(
+-        a < 2.0,
+-        tldevice.rint(a * 2.0),
+-        tl.where(a < 4.0, tldevice.rint(a) + 2.0, tl.where(a < 5.0, 6.0, 7.0)),
+-    ).to(tl.int32)
+-    code = code | tl.where(y < 0.0, 8, 0)
+-    lo, hi = tl.split(tl.reshape(code, [HEAD_DIM // 2, 2]))
+-    packed = (lo | (hi << 4)).to(tl.uint8)
+-    dh = tl.arange(0, HEAD_DIM // 2)
+-    tl.store(vd_ptr + page_base + row * (HEAD_DIM // 2) + dh, packed)
+-    ds = tl.arange(0, HEAD_DIM // 16)
+-    tl.store(
+-        vs_ptr + page_base + row * (HEAD_DIM // 16) + ds,
+-        bs.to(tl.uint8, bitcast=True),
+-    )
++    # Values: NVFP4 per 16 elements (emulation-exact rounding); byte j packs
++    # elements j (low nibble) and j + D/2 (high nibble).
++    HALF: tl.constexpr = HEAD_DIM // 2
++    dh = tl.arange(0, HALF)
++    vrow = value_ptr + t * stride_vt + h * stride_vh
++    v_lo = tl.math.div_rn(tl.load(vrow + dh).to(tl.float32), vg)
++    v_hi = tl.math.div_rn(tl.load(vrow + HALF + dh).to(tl.float32), vg)
++    c_lo, s_lo = _quant_nvfp4_half(v_lo, HALF)
++    c_hi, s_hi = _quant_nvfp4_half(v_hi, HALF)
++    packed = (c_lo | (c_hi << 4)).to(tl.uint8)
++    tl.store(vd_ptr + page_base + row * HALF + dh, packed)
++    ds = tl.arange(0, HALF // 16)
++    srow = vs_ptr + page_base + row * (HEAD_DIM // 16)
++    tl.store(srow + ds, s_lo.to(tl.uint8, bitcast=True))
++    tl.store(srow + HALF // 16 + ds, s_hi.to(tl.uint8, bitcast=True))
+ 
+ 
+ def k8v4_store(
+@@ -248,11 +254,13 @@ def _k8v4_decode_stage1(
+     GROUP: tl.constexpr,
+     HEAD_DIM: tl.constexpr,
+     PAGE: tl.constexpr,
++    BLOCK_N: tl.constexpr,
+     NUM_SPLITS: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     QLEN: tl.constexpr,
+     RAGGED: tl.constexpr,
+ ):
++    HALF: tl.constexpr = HEAD_DIM // 2
+     b = tl.program_id(0)
+     kvh = tl.program_id(1)
+     sp = tl.program_id(2)
+@@ -275,34 +283,35 @@ def _k8v4_decode_stage1(
+         q_ptr + trow[:, None] * stride_qt + qh[:, None] * stride_qh + d[None, :],
+         mask=row_ok[:, None],
+         other=0.0,
+-    ).to(tl.bfloat16)
++    ).to(tl.float16)
+     qpos = seq_len - ql + tq
+ 
+-    num_pages = tl.cdiv(seq_len, PAGE)
+-    pps = tl.cdiv(num_pages, NUM_SPLITS)
+-    p_start = sp * pps
+-    p_end = tl.minimum(p_start + pps, num_pages)
++    num_tiles = tl.cdiv(seq_len, BLOCK_N)
++    tps = tl.cdiv(num_tiles, NUM_SPLITS)
++    t_start = sp * tps
++    t_end = tl.minimum(t_start + tps, num_tiles)
+ 
+     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+     l_i = tl.zeros([BLOCK_M], tl.float32)
+-    acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
++    acc_lo = tl.zeros([BLOCK_M, HALF], tl.float32)
++    acc_hi = tl.zeros([BLOCK_M, HALF], tl.float32)
+ 
+-    n = tl.arange(0, PAGE)
+-    dh = tl.arange(0, HEAD_DIM // 2)
+-    ds = tl.arange(0, HEAD_DIM // 16)
+-    krow = (kvh * PAGE + n).to(tl.int64)
++    n = tl.arange(0, BLOCK_N)
++    dh = tl.arange(0, HALF)
++    sidx = dh // 16
+     bt_row = bt_ptr + b.to(tl.int64) * stride_bt
+-    for p in range(p_start, p_end):
+-        blk = tl.load(bt_row + p).to(tl.int64)
+-        base = blk * page_stride
+-        kvpos = p * PAGE + n
++    for it in range(t_start, t_end):
++        kvpos = it * BLOCK_N + n
+         kv_ok = kvpos < seq_len
++        blk = tl.load(bt_row + kvpos // PAGE, mask=kv_ok, other=0).to(tl.int64)
++        pbase = blk * page_stride
++        r = (kvh * PAGE + kvpos % PAGE).to(tl.int64)
+         kt = tl.load(
+-            k_ptr + base + krow[:, None] * HEAD_DIM + d[None, :],
++            k_ptr + (pbase + r * HEAD_DIM)[:, None] + d[None, :],
+             mask=kv_ok[:, None],
+             other=0,
+         )
+-        kt = kt.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
++        kt = kt.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+         s = tl.dot(q, tl.trans(kt)) * qk_scale_log2
+         allowed = (kvpos[None, :] <= qpos[:, None]) & kv_ok[None, :]
+         s = tl.where(allowed, s, float("-inf"))
+@@ -311,39 +320,41 @@ def _k8v4_decode_stage1(
+         alpha = tl.exp2(m_i - m_safe)
+         pm = tl.exp2(s - m_safe[:, None])
+         l_i = l_i * alpha + tl.sum(pm, 1)
++        p16 = pm.to(tl.float16)
+ 
+-        vd = tl.load(
+-            vd_ptr + base + krow[:, None] * (HEAD_DIM // 2) + dh[None, :],
+-            mask=kv_ok[:, None],
+-            other=0,
+-        ).to(tl.int32)
+-        vsc = tl.load(
+-            vs_ptr + base + krow[:, None] * (HEAD_DIM // 16) + ds[None, :],
+-            mask=kv_ok[:, None],
+-            other=0,
++        voff = (pbase + r * HALF)[:, None]
++        vd = tl.load(vd_ptr + voff + dh[None, :], mask=kv_ok[:, None], other=0).to(
++            tl.int32
+         )
+-        vsc = vsc.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+-        v = _dequant_v_tile(vd, vsc, v_scale, HEAD_DIM, PAGE).to(tl.bfloat16)
+-        acc = acc * alpha[:, None] + tl.dot(pm.to(tl.bfloat16), v)
++        soff = (pbase + r * (HEAD_DIM // 16))[:, None]
++        sc_lo = tl.load(vs_ptr + soff + sidx[None, :], mask=kv_ok[:, None], other=0)
++        sc_hi = tl.load(
++            vs_ptr + soff + (HALF // 16) + sidx[None, :], mask=kv_ok[:, None], other=0
++        )
++        sc_lo = sc_lo.to(tl.float8e4nv, bitcast=True).to(tl.float16)
++        sc_hi = sc_hi.to(tl.float8e4nv, bitcast=True).to(tl.float16)
++        v_lo = _e2m1_f16_scaled(vd & 15) * sc_lo
++        v_hi = _e2m1_f16_scaled(vd >> 4) * sc_hi
++        acc_lo = acc_lo * alpha[:, None] + tl.dot(p16, v_lo)
++        acc_hi = acc_hi * alpha[:, None] + tl.dot(p16, v_hi)
+         m_i = m_new
+ 
+     has = l_i > 0.0
+-    o = acc / tl.where(has, l_i, 1.0)[:, None]
++    inv = tl.where(has, (16384.0 * v_scale) / tl.where(has, l_i, 1.0), 0.0)
++    o_lo = acc_lo * inv[:, None]
++    o_hi = acc_hi * inv[:, None]
+     if NUM_SPLITS == 1:
+-        tl.store(
+-            out_ptr + trow[:, None] * stride_ot + qh[:, None] * stride_oh + d[None, :],
+-            o.to(out_ptr.dtype.element_ty),
+-            mask=row_ok[:, None],
+-        )
++        optr = out_ptr + trow[:, None] * stride_ot + qh[:, None] * stride_oh + dh[None, :]
++        tl.store(optr, o_lo.to(out_ptr.dtype.element_ty), mask=row_ok[:, None])
++        tl.store(optr + HALF, o_hi.to(out_ptr.dtype.element_ty), mask=row_ok[:, None])
+     else:
+         lse = tl.where(has, m_i + tl.log2(tl.where(has, l_i, 1.0)), float("-inf"))
+         mid = (trow * NUM_Q_HEADS + qh) * NUM_SPLITS + sp
+         tl.store(mid_l_ptr + mid, lse, mask=row_ok)
+-        tl.store(
+-            mid_o_ptr + mid[:, None] * HEAD_DIM + d[None, :],
+-            o,
+-            mask=row_ok[:, None] & has[:, None],
+-        )
++        mptr = mid_o_ptr + mid[:, None] * HEAD_DIM + dh[None, :]
++        msk = row_ok[:, None] & has[:, None]
++        tl.store(mptr, o_lo, mask=msk)
++        tl.store(mptr + HALF, o_hi, mask=msk)
+ 
+ 
+ @triton.jit
+@@ -412,6 +423,7 @@ def k8v4_decode(
+     q_cu_seq_lens: torch.Tensor | None = None,
+     num_splits: int | None = None,
+     block_m: int | None = None,
++    block_n: int | None = None,
+     num_warps: int = 4,
+     num_stages: int = 2,
+ ) -> torch.Tensor:
+@@ -437,6 +449,10 @@ def k8v4_decode(
+     if block_m is None:
+         block_m = max(16, triton.next_power_of_2(q_len_per_req * group))
+     assert block_m >= q_len_per_req * group
++    if block_n is None:
++        block_n = int(os.environ.get("VLLM_K8V4_DECODE_BLOCK_N", "64"))
++    block_n = max(block_n, 16)
++    assert block_n % page == 0 or page % block_n == 0, (block_n, page)
+     ragged = q_cu_seq_lens is not None
+     if num_splits > 1:
+         mid_l = torch.empty(
+@@ -474,6 +490,7 @@ def k8v4_decode(
+         GROUP=group,
+         HEAD_DIM=head_size,
+         PAGE=page,
++        BLOCK_N=block_n,
+         NUM_SPLITS=num_splits,
+         BLOCK_M=block_m,
+         QLEN=q_len_per_req,
+@@ -546,21 +563,24 @@ def _k8v4_gather_kernel(
+             out_k_ptr + obase + n[:, None] * HEAD_DIM + d[None, :],
+             kt.to(out_k_ptr.dtype.element_ty),
+         )
+-    dh = tl.arange(0, HEAD_DIM // 2)
+-    ds = tl.arange(0, HEAD_DIM // 16)
+-    vd = tl.load(vd_ptr + base + row[:, None] * (HEAD_DIM // 2) + dh[None, :]).to(
+-        tl.int32
+-    )
+-    vsc = tl.load(vs_ptr + base + row[:, None] * (HEAD_DIM // 16) + ds[None, :])
+-    vsc = vsc.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    HALF: tl.constexpr = HEAD_DIM // 2
++    dh = tl.arange(0, HALF)
++    sidx = dh // 16
++    vd = tl.load(vd_ptr + base + row[:, None] * HALF + dh[None, :]).to(tl.int32)
++    srow = vs_ptr + base + row[:, None] * (HEAD_DIM // 16)
++    s_lo = tl.load(srow + sidx[None, :]).to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    s_hi = tl.load(srow + HALF // 16 + sidx[None, :]).to(tl.float8e4nv, bitcast=True)
++    s_hi = s_hi.to(tl.float32)
++    g = 1.0 if OUT_FP8 else v_scale  # FP8: the global scale stays the FMHA's v_scale
++    v_lo = (_e2m1_to_f32(vd & 15) * s_lo) * g
++    v_hi = (_e2m1_to_f32(vd >> 4) * s_hi) * g
++    optr = out_v_ptr + obase + n[:, None] * HEAD_DIM + dh[None, :]
+     if OUT_FP8:
+-        # e2m1 * bs (the global scale stays outside, as the FMHA's v_scale)
+-        v = _dequant_v_tile(vd, vsc, 1.0, HEAD_DIM, PAGE)
+-        v = tl.clamp(v, -448.0, 448.0).to(tl.float8e4nv)
++        tl.store(optr, tl.clamp(v_lo, -448.0, 448.0).to(tl.float8e4nv))
++        tl.store(optr + HALF, tl.clamp(v_hi, -448.0, 448.0).to(tl.float8e4nv))
+     else:
+-        v = _dequant_v_tile(vd, vsc, v_scale, HEAD_DIM, PAGE)
+-        v = v.to(out_v_ptr.dtype.element_ty)
+-    tl.store(out_v_ptr + obase + n[:, None] * HEAD_DIM + d[None, :], v)
++        tl.store(optr, v_lo.to(out_v_ptr.dtype.element_ty))
++        tl.store(optr + HALF, v_hi.to(out_v_ptr.dtype.element_ty))
+ 
+ 
+ def k8v4_gather_pages(
+@@ -698,7 +718,7 @@ def k8v4_read_cache_ref(
+         dtype=torch.float32,
+         device=k.device,
+     )
+-    codes = torch.stack([vd & 15, vd >> 4], dim=-1).flatten(-2).long()
++    codes = torch.cat([vd & 15, vd >> 4], dim=-1).long()
+     vals = lut[codes]
+     sc = vs.view(FP8_DTYPE).float().repeat_interleave(16, dim=-1)
+     vf = ((vals * sc) * v_scale).to(torch.bfloat16)

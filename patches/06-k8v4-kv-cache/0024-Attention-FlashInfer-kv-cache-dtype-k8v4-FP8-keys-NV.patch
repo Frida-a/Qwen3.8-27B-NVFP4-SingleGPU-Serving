@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:03:54 -0800
+Subject: [PATCH] [Attention] FlashInfer: --kv-cache-dtype k8v4 (FP8 keys +
+ NVFP4 values)
+
+New KV cache dtype k8v4 (KVQuantMode.K8V4): one slot per KV head with
+D + D/2 + D/16 bytes, split-plane HND pages. FlashInfer backend only
+(SM100/SM120), kernel pages <= 64, HND layout forced. The builder plans it
+as fp8_e4m3 (same page indices, FP8-Q prefill, SM120 compact gather forced
+on); the impl writes with k8v4_store, prefills on dense FP8 pages from
+k8v4_gather_pages (SM120 cute-dsl-prims) or k8v4_mock_paged (SM100
+trtllm-gen context) and decodes / verifies with the Triton k8v4_decode
+(BF16 Q, XQA/trtllm-gen decode metadata). No q pre-quantization or output
+quant fusion. Every other cache dtype takes the unchanged code path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/config/cache.py                     |   4 +
+ vllm/utils/torch_utils.py                |   1 +
+ vllm/v1/attention/backends/flashinfer.py | 123 ++++++++++++++++++++++-
+ vllm/v1/kv_cache_interface.py            |   5 +
+ 4 files changed, 132 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 5832203de..c8780a51c 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -64,6 +64,7 @@ CacheDType = Literal[
+     "fp8_per_token_head",
+     "nvfp4",
+     "nvfp4_4over6",
++    "k8v4",
+ ]
+ 
+ # Mutable mirror of the CacheDType Literal. Custom dtypes registered by
+@@ -247,6 +248,9 @@ class CacheConfig:
+     to fp8.
+     "nvfp4_4over6" uses the NVFP4 layout and selects between max/6 and max/4
+     scales per 16 values by minimizing squared reconstruction error.
++    "k8v4" stores FP8 E4M3 keys and NVFP4 values (E2M1 + E4M3 block scales per
++    16 + the layer's v_scale as global scale); FlashInfer backend, SM100/SM120,
++    HND layout (vllm/v1/attention/ops/k8v4_kv.py).
+     """
+     is_attention_free: bool = False
+     """Whether the model is attention-free. This is primarily set in
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index 634356ccd..54499cb2d 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -65,6 +65,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
+     "ultraquant_4bit": torch.uint8,
+     "nvfp4": torch.uint8,
+     "nvfp4_4over6": torch.uint8,
++    "k8v4": torch.uint8,
+ }
+ 
+ TORCH_DTYPE_TO_NUMPY_DTYPE = {
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 01a1ed23a..f591d6c6a 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -102,6 +102,12 @@ from vllm.v1.kv_cache_interface import (
+     is_quantized_kv_cache,
+     iter_layer_specs,
+ )
++from vllm.v1.attention.ops.k8v4_kv import (
++    k8v4_decode,
++    k8v4_gather_pages,
++    k8v4_mock_paged,
++    k8v4_store,
++)
+ from vllm.v1.utils import CpuGpuBuffer
+ 
+ FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
+@@ -109,6 +115,16 @@ FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
+ 
+ FP8_DTYPE = current_platform.fp8_dtype()
+ FP4_DTYPE = torch.uint8
++K8V4_CACHE_DTYPE = "k8v4"  # FP8 keys + NVFP4 values (vllm/v1/attention/ops/k8v4_kv.py)
++
++
++def _k8v4_configured() -> bool:
++    vllm_config = get_current_vllm_config_or_none()
++    return (
++        vllm_config is not None
++        and vllm_config.cache_config is not None
++        and vllm_config.cache_config.cache_dtype == K8V4_CACHE_DTYPE
++    )
+ 
+ logger = init_logger(__name__)
+ 
+@@ -575,6 +591,16 @@ class FlashInferBackend(AttentionBackend):
+     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+         """NVFP4 stores K and V as separate per-head slots of packed fp4 data
+         plus fp8 block scales."""
++        if spec.state_content_bytes is None and spec.kv_quant_mode == KVQuantMode.K8V4:
++            from vllm.v1.attention.ops.k8v4_kv import k8v4_head_bytes
++
++            assert spec.head_size == spec.head_size_v, "k8v4 needs equal K/V head sizes"
++            # one slot per KV head: [K fp8 | V packed e2m1 | V e4m3 scales]
++            return replace(
++                spec,
++                state_content_bytes=k8v4_head_bytes(spec.head_size)
++                * get_dtype_size(spec.dtype),
++            )
+         if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
+             return spec
+         hs_k = nvfp4_kv_cache_full_dim(spec.head_size)
+@@ -596,10 +622,17 @@ class FlashInferBackend(AttentionBackend):
+         "fp8_e5m2",
+         "nvfp4",
+         "nvfp4_4over6",
++        K8V4_CACHE_DTYPE,
+     ]
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
++        if (
++            kv_cache_spec is not None
++            and getattr(kv_cache_spec, "kv_quant_mode", None) == KVQuantMode.K8V4
++        ) or _k8v4_configured():
++            # Triton decode / gather kernels and the FP8 prefill FMHAs: <= 64.
++            return [16, 32, 64]
+         # Page sizes >= 128 only run on the trtllm-gen dynamic kernel (GQA/MQA
+         # on Blackwell); advertise them only when usable so selection never
+         # picks a large kernel block we cannot serve.
+@@ -669,6 +702,11 @@ class FlashInferBackend(AttentionBackend):
+ 
+     @classmethod
+     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
++        if kv_cache_dtype == K8V4_CACHE_DTYPE:
++            # FP8 prefill FMHA: cute-dsl-prims (SM120) / trtllm-gen (SM100).
++            return current_platform.is_device_capability_family(
++                100
++            ) or current_platform.is_device_capability_family(120)
+         if kv_cache_dtype is not None and kv_cache_dtype.startswith("nvfp4"):
+             if _nvfp4_kv_on_fa2():
+                 # The slot-mapping writer has no scale search.
+@@ -749,6 +787,9 @@ class FlashInferBackend(AttentionBackend):
+             # The trtllm-gen kernels consume head-major block interiors; the L/B
+             # nesting outside the block is immaterial to them.
+             return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
++        if _k8v4_configured():
++            # K8V4 split-plane pages need contiguous [H, N, C] page interiors.
++            return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
+         if (
+             capability is not None
+             and capability.major == 12
+@@ -975,8 +1016,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         self.head_dim = self.kv_cache_spec.head_size
+         self.page_size = self.kv_cache_spec.block_size
+ 
++        self.is_kvcache_k8v4 = False
+         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
+             self.cache_dtype = self._resolve_cache_dtype()
++            if self.cache_dtype == K8V4_CACHE_DTYPE:
++                # K8V4 plans exactly like an fp8_e4m3 cache: the impl gathers
++                # dense FP8 pages for prefill and runs its own Triton decode.
++                if self.use_dcp:
++                    raise NotImplementedError("k8v4 KV cache does not support DCP")
++                self.is_kvcache_k8v4 = True
++                self.cache_dtype = "fp8_e4m3"
+             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
+             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
+             self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
+@@ -1021,6 +1070,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         # as on SM100 trtllm-gen with an fp8 KV cache. Needs an fp8_e4m3 cache,
+         # HND layout and a kernel page size in {16, 32, 64, 128}.
+         fp8_pf_on, fp8_pf_explicit = _sm120_fp8_prefill_env()
++        if self.is_kvcache_k8v4:
++            # K8V4 prefill reads gathered FP8 pages with the FP8 FMHA (required).
++            fp8_pf_on, fp8_pf_explicit = True, True
+         self.sm120_fp8_prefill = (
+             fp8_pf_on
+             and current_platform.is_device_capability(120)
+@@ -2169,6 +2221,7 @@ class FlashInferImpl(AttentionImpl):
+             self.sliding_window[0] if self.sliding_window is not None else -1
+         )
+         self.cache_dtype = kv_cache_dtype
++        self.is_kvcache_k8v4 = kv_cache_dtype == K8V4_CACHE_DTYPE
+         self.is_kvcache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
+         self.nvfp4_fa2 = self.is_kvcache_nvfp4 and _nvfp4_kv_on_fa2()
+         self.nvfp4_trtllm = self.is_kvcache_nvfp4 and not self.nvfp4_fa2
+@@ -2211,6 +2264,16 @@ class FlashInferImpl(AttentionImpl):
+             and current_platform.is_device_capability_family(100)
+             and vllm_config is not None
+             and not vllm_config.attention_config.disable_flashinfer_q_quantization
++            and not self.is_kvcache_k8v4  # K8V4 decode takes the BF16 query
++        )
++        if self.is_kvcache_k8v4 and (
++            self.sinks is not None or self.window_left != -1 or logits_soft_cap
++        ):
++            raise NotImplementedError("k8v4 KV cache: no sinks, sliding window or soft cap")
++        # Upper bound on decode/verify rows per request (Triton tile height).
++        spec_cfg = vllm_config.speculative_config if vllm_config is not None else None
++        self._k8v4_max_q = 1 + (
++            (spec_cfg.num_speculative_tokens or 0) if spec_cfg is not None else 0
+         )
+         self.bmm1_scale: float | None = None
+         self.bmm2_scale: float | None = None
+@@ -2252,6 +2315,8 @@ class FlashInferImpl(AttentionImpl):
+             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+ 
+     def fused_output_quant_supported(self, quant_key: QuantKey):
++        if self.is_kvcache_k8v4:
++            return False
+         if quant_key == kNvfp4Dynamic and self.is_kvcache_nvfp4:
+             logger.warning_once(
+                 "fuse_attn_quant: not registering the NVFP4-output attention "
+@@ -2538,7 +2603,19 @@ class FlashInferImpl(AttentionImpl):
+                     assert prefill_wrapper._sm_scale == self.scale
+                     assert prefill_wrapper._causal == attn_metadata.causal
+ 
+-                    if self.is_kvcache_nvfp4:
++                    if self.is_kvcache_k8v4:
++                        # dense FP8 pages: K copied, NVFP4 V dequantized (+E4M3)
++                        if attn_metadata.prefill.sm120_gather is None:
++                            raise NotImplementedError(
++                                "k8v4 KV cache: FlashInfer native prefill needs the "
++                                "compact page gather (SM120 FP8 prefill)"
++                            )
++                        kv_cache_for_fi = k8v4_gather_pages(
++                            kv_cache_permute,
++                            attn_metadata.prefill.sm120_gather,
++                            self.head_size,
++                        )
++                    elif self.is_kvcache_nvfp4:
+                         kv_cache_for_fi = nvfp4_kv_data
+                     elif attn_metadata.prefill.sm120_gather is not None:
+                         # compact K and V planes of the prefill requests' pages
+@@ -2640,6 +2717,16 @@ class FlashInferImpl(AttentionImpl):
+                     mock_kv_cache = nvfp4_kv_data
+                     mock_block_table = block_tables_prefill
+                     prefill_kv_block_scales = nvfp4_kv_block_scales
++                elif self.is_kvcache_k8v4:
++                    # dense FP8 mock pages (K copied, NVFP4 V dequantized)
++                    assert attn_metadata.q_data_type_prefill == FP8_DTYPE
++                    mock_kv_cache, mock_block_table = k8v4_mock_paged(
++                        kv_cache_permute,
++                        block_tables_prefill,
++                        seq_lens_prefill,
++                        attn_metadata.prefill.max_seq_len,
++                        self.head_size,
++                    )
+                 elif (
+                     attn_metadata.q_data_type_prefill != FP8_DTYPE
+                     and self.kv_cache_dtype.startswith("fp8")
+@@ -2702,6 +2789,35 @@ class FlashInferImpl(AttentionImpl):
+                         num_decode_tokens : num_decode_tokens + num_prefill_tokens
+                     ].copy_(out[:num_prefill_tokens])
+ 
++        if num_decode_tokens > 0 and self.is_kvcache_k8v4:
++            # Triton decode / multi-token verify over FP8 K + NVFP4 V (BF16 Q).
++            dec = attn_metadata.decode
++            if not isinstance(dec, FlashInferTrtllmAPIDecode):
++                raise NotImplementedError(
++                    "k8v4 KV cache needs the XQA / trtllm-gen decode metadata path"
++                )
++            ragged = dec.q_cu_seq_lens is not None
++            if ragged or dec.q_len_per_req > 1:
++                n_rows = num_decode_tokens
++            else:
++                n_rows = dec.block_tables.shape[0]  # padded single-token batch
++            k8v4_decode(
++                query_padded[:n_rows],
++                kv_cache_permute,
++                dec.block_tables,
++                dec.seq_lens,
++                output_padded[:n_rows],
++                self.scale,
++                k_scale=layer._k_scale_float,
++                v_scale=layer._v_scale_float,
++                q_len_per_req=(
++                    max(dec.q_len_per_req, self._k8v4_max_q)
++                    if ragged
++                    else max(1, dec.q_len_per_req)
++                ),
++                q_cu_seq_lens=dec.q_cu_seq_lens,
++            )
++            return output_padded
+         if num_decode_tokens > 0:
+             decode_query_tokens = num_decode_tokens
+             if decode_with_xqa:
+@@ -2955,6 +3071,11 @@ class FlashInferImpl(AttentionImpl):
+             # and value[:num_actual_tokens] because the reshape_and_cache_flash
+             # op uses the slot_mapping's shape to determine the number of
+             # actual tokens.
++            if self.is_kvcache_k8v4:
++                k8v4_store(
++                    key, value, kv_cache, slot_mapping, layer._k_scale, layer._v_scale
++                )
++                return
+             if self.nvfp4_fa2:
+                 data, scales, kv_layout = _nvfp4_kv_views(kv_cache, self.num_kv_heads)
+                 nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 5cc6bf0e1..606c8a6c5 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -65,6 +65,9 @@ class KVQuantMode(IntEnum):
+     OCTAVE_K3V4 = 12
+     OCTAVE_K3V3 = 13
+     OCTAVE_K3V3_COMPACT = 14
++    # FP8 E4M3 keys + NVFP4 values (packed E2M1 + E4M3 block scales), one
++    # slot per KV head, split-plane pages (vllm/v1/attention/ops/k8v4_kv.py).
++    K8V4 = 16
+ 
+     # Backend self-manages kernel dispatch. Reads as quantized but matches no
+     # generic kernel mode (is_per_token_head / is_nvfp4 / is_turboquant all
+@@ -137,6 +140,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
+         return KVQuantMode[kv_cache_dtype.upper()]
+     if kv_cache_dtype == "ultraquant_4bit":
+         return KVQuantMode.ULTRAQUANT_4BIT
++    if kv_cache_dtype == "k8v4":
++        return KVQuantMode.K8V4
+     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+         return KVQuantMode.FP8_PER_TENSOR
+     return KVQuantMode.NONE

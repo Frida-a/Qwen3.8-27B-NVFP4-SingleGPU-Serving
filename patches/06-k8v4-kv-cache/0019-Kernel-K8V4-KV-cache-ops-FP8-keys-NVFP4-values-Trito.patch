@@ -1,0 +1,986 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:40:24 -0800
+Subject: [PATCH] [Kernel] K8V4 KV cache ops: FP8 keys + NVFP4 values (Triton
+ writer, decode, prefill gather)
+
+Triton kernels for a K8V4 KV cache (FP8 E4M3 keys, NVFP4 values with E4M3
+block scales per 16 elements and a per-layer global scale), page planes
+[K | V codes | V scales] per HND page. The writer reproduces the QW38
+accuracy emulation's quantizers exactly; decode/verify runs BF16 math on
+exactly dequantized K/V; the gather produces dense FP8 pages for the FP8
+prefill FMHAs. Unit tests vs the emulation and an FP32 reference.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/attention/test_k8v4_kv.py | 248 +++++++++
+ vllm/v1/attention/ops/k8v4_kv.py        | 705 ++++++++++++++++++++++++
+ 2 files changed, 953 insertions(+)
+ create mode 100644 tests/kernels/attention/test_k8v4_kv.py
+ create mode 100644 vllm/v1/attention/ops/k8v4_kv.py
+
+diff --git a/tests/kernels/attention/test_k8v4_kv.py b/tests/kernels/attention/test_k8v4_kv.py
+new file mode 100644
+index 000000000..41a2c0494
+--- /dev/null
++++ b/tests/kernels/attention/test_k8v4_kv.py
+@@ -0,0 +1,248 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""K8V4 KV cache kernels (FP8 keys, NVFP4 values): writer vs the QW38 emulation
++quantizers (bitwise), decode / multi-token verify vs an FP32 reference on the
++emulated K/V, CUDA-graph replay == eager, prefill page gather."""
++
++import math
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops.k8v4_kv import (
++    FP8_DTYPE,
++    k8v4_decode,
++    k8v4_gather_pages,
++    k8v4_head_bytes,
++    k8v4_mock_paged,
++    k8v4_read_cache_ref,
++    k8v4_store,
++    qdq_fp8_ref,
++    qdq_nvfp4_ref,
++)
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA required", allow_module_level=True)
++
++DEV = "cuda"
++D = 256
++HKV = 4
++GROUP = 6
++
++
++def _make_cache(num_blocks, page, hkv=HKV, d=D):
++    c = torch.randint(0, 256, (num_blocks, hkv, page, k8v4_head_bytes(d)),
++                      dtype=torch.uint8, device=DEV)
++    return c
++
++
++def _kv(t, hkv=HKV, d=D, seed=0):
++    g = torch.Generator(device=DEV).manual_seed(seed)
++    k = torch.randn(t, hkv, d, generator=g, device=DEV) * 2.0
++    v = torch.randn(t, hkv, d, generator=g, device=DEV)
++    # heavy-tailed channels, zero blocks, exact ties and huge values
++    v[:, :, 5] *= 40.0
++    v[::7, :, 16:32] = 0.0
++    if t > 3:
++        v[3, 0, 32:48] = torch.tensor([6, 5, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 4.5,
++                                       -5, -0.25, -2.5, 3, 1, 0.5, 0], device=DEV)
++        v[2, 1, 48:64] = 3000.0
++        k[2, 1, :8] = 600.0
++    return k.to(torch.bfloat16), v.to(torch.bfloat16)
++
++
++@pytest.mark.parametrize("page", [16, 64])
++@pytest.mark.parametrize("scales", [(1.0, 1.0), (0.75, 0.37)])
++def test_store_matches_emulation(page, scales):
++    ks, vg = scales
++    t = 300
++    k, v = _kv(t)
++    nb = 2 + (t + page - 1) // page * 2
++    cache = _make_cache(nb, page)
++    slots = torch.randperm((nb - 1) * page, device=DEV)[:t] + page  # skip block 0
++    slots[5] = -1
++    k8v4_store(k, v, cache, slots, torch.tensor(ks, device=DEV),
++               torch.tensor(vg, device=DEV))
++    kf, vf = k8v4_read_cache_ref(cache, D, v_scale=vg, k_scale=ks)
++    ok = slots >= 0
++    sl = slots[ok]
++    blk, off = sl // page, sl % page
++    got_k = kf[blk, :, off]  # [n, H, D]
++    got_v = vf[blk, :, off]
++    exp_k = qdq_fp8_ref(k[ok].reshape(-1, HKV * D), ks).view(-1, HKV, D)
++    exp_v = qdq_nvfp4_ref(v[ok].reshape(-1, HKV * D), vg).view(-1, HKV, D)
++    assert torch.equal(got_k, exp_k)
++    assert torch.equal(got_v, exp_v), (got_v - exp_v).abs().max()
++    # skipped slot untouched: the slot mapped to token 5 is -1, nothing to check;
++    # bitwise equality above already covers every written slot.
++
++
++def _ref_attention(q, kf, vf, block_tables, seq_lens, q_starts, q_lens, scale):
++    """FP32 reference on decoded K/V; returns [T, Hq, D]."""
++    out = torch.zeros(q.shape, dtype=torch.float32, device=DEV)
++    page = kf.shape[2]
++    for b in range(block_tables.shape[0]):
++        s, ql, q0 = int(seq_lens[b]), int(q_lens[b]), int(q_starts[b])
++        if s == 0 or ql == 0:
++            continue
++        npg = (s + page - 1) // page
++        ids = block_tables[b, :npg].long()
++        kk = kf[ids].permute(1, 0, 2, 3).reshape(HKV, -1, D)[:, :s].float()
++        vv = vf[ids].permute(1, 0, 2, 3).reshape(HKV, -1, D)[:, :s].float()
++        qq = q[q0:q0 + ql].float().view(ql, HKV, GROUP, D)
++        sc = torch.einsum("thgd,hnd->thgn", qq, kk) * scale
++        pos = torch.arange(s, device=DEV)
++        qpos = s - ql + torch.arange(ql, device=DEV)
++        mask = pos[None, :] <= qpos[:, None]
++        sc = sc.masked_fill(~mask[:, None, None, :], float("-inf"))
++        p = torch.softmax(sc, dim=-1)
++        o = torch.einsum("thgn,hnd->thgd", p, vv)
++        out[q0:q0 + ql] = o.reshape(ql, HKV * GROUP, D)
++    return out
++
++
++def _setup_decode(seq_lens_list, q_lens_list, page, seed=1):
++    torch.manual_seed(seed)
++    nreq = len(seq_lens_list)
++    max_pages = max((s + page - 1) // page for s in seq_lens_list) + 1
++    nb = nreq * max_pages + 4
++    cache = _make_cache(nb, page)
++    perm = torch.randperm(nb - 1, device=DEV) + 1
++    bt = perm[: nreq * max_pages].view(nreq, max_pages).to(torch.int32).contiguous()
++    for b, s in enumerate(seq_lens_list):
++        if s == 0:
++            continue
++        k, v = _kv(s, seed=seed + b)
++        pos = torch.arange(s, device=DEV)
++        slots = bt[b, pos // page].long() * page + pos % page
++        k8v4_store(k, v, cache, slots, torch.tensor(1.0, device=DEV),
++                   torch.tensor(1.0, device=DEV))
++    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=DEV)
++    q_lens = torch.tensor(q_lens_list, dtype=torch.int32, device=DEV)
++    q_cu = torch.zeros(nreq + 1, dtype=torch.int32, device=DEV)
++    q_cu[1:] = torch.cumsum(q_lens, 0)
++    t = int(q_cu[-1])
++    q = (torch.randn(t, HKV * GROUP, D, device=DEV) * 2).to(torch.bfloat16)
++    return cache, bt, seq_lens, q_lens, q_cu, q
++
++
++def _check(out, ref):
++    err = (out.float() - ref).abs().max().item()
++    rel = ((out.float() - ref).norm() / ref.norm().clamp_min(1e-6)).item()
++    assert err < 3e-2 and rel < 6e-3, (err, rel)
++
++
++@pytest.mark.parametrize("page", [16, 64])
++@pytest.mark.parametrize("qlen", [1, 4, 8])
++@pytest.mark.parametrize("splits", [1, 3, None])
++def test_decode_uniform(page, qlen, splits):
++    seqs = [qlen, 63 + qlen, 64, 1000, 5003, 0]
++    seqs = [max(s, qlen) if s else 0 for s in seqs]
++    qls = [qlen if s else 0 for s in seqs]
++    # uniform: padded request (seq 0) still owns qlen rows
++    qls_u = [qlen] * len(seqs)
++    cache, bt, sl, _, _, _ = _setup_decode(seqs, qls_u, page)
++    t = qlen * len(seqs)
++    q = (torch.randn(t, HKV * GROUP, D, device=DEV) * 2).to(torch.bfloat16)
++    out = torch.empty_like(q)
++    scale = 1.0 / math.sqrt(D)
++    k8v4_decode(q, cache, bt, sl, out, scale, q_len_per_req=qlen, num_splits=splits)
++    kf, vf = k8v4_read_cache_ref(cache, D)
++    starts = torch.arange(len(seqs)) * qlen
++    ref = _ref_attention(q, kf, vf, bt, sl, starts, torch.tensor(qls), scale)
++    real = torch.tensor([s > 0 for s in seqs]).repeat_interleave(qlen).to(DEV)
++    _check(out[real], ref[real])
++    assert torch.all(out[~real] == 0)
++
++
++@pytest.mark.parametrize("splits", [1, 4])
++def test_decode_ragged(splits):
++    seqs = [5, 200, 4096, 77]
++    qls = [1, 4, 3, 2]
++    cache, bt, sl, ql, qcu, q = _setup_decode(seqs, qls, 64)
++    out = torch.empty_like(q)
++    scale = 1.0 / math.sqrt(D)
++    k8v4_decode(q, cache, bt, sl, out, scale, q_len_per_req=4, q_cu_seq_lens=qcu,
++                num_splits=splits)
++    kf, vf = k8v4_read_cache_ref(cache, D)
++    ref = _ref_attention(q, kf, vf, bt, sl, qcu[:-1], ql, scale)
++    _check(out, ref)
++
++
++def test_decode_matches_emulated_bf16_cache():
++    """The kernel on a K8V4 cache == the same kernel math on the emulation's
++    BF16 values: compare against SDPA in BF16 on qdq'd K/V."""
++    seqs, qls = [3000], [4]
++    cache, bt, sl, ql, qcu, q = _setup_decode(seqs, qls, 64, seed=7)
++    out = torch.empty_like(q)
++    scale = 1.0 / math.sqrt(D)
++    k8v4_decode(q, cache, bt, sl, out, scale, q_len_per_req=4)
++    k, v = _kv(3000, seed=7)
++    ke = qdq_fp8_ref(k.reshape(3000, -1), 1.0).view(3000, HKV, D)
++    ve = qdq_nvfp4_ref(v.reshape(3000, -1), 1.0).view(3000, HKV, D)
++    qq = q.view(4, HKV * GROUP, D).transpose(0, 1)  # [Hq, 4, D]
++    kk = ke.transpose(0, 1).repeat_interleave(GROUP, 0)
++    vv = ve.transpose(0, 1).repeat_interleave(GROUP, 0)
++    mask = torch.arange(3000, device=DEV)[None] <= (3000 - 4 + torch.arange(4, device=DEV))[:, None]
++    ref = torch.nn.functional.scaled_dot_product_attention(
++        qq, kk, vv, attn_mask=mask, scale=scale).transpose(0, 1)
++    err = (out.float() - ref.float()).abs().max().item()
++    assert err < 3e-2, err
++
++
++def test_decode_cuda_graph_replay():
++    seqs, qls = [700, 3000, 64, 9], [4, 4, 4, 4]
++    cache, bt, sl, ql, qcu, q = _setup_decode(seqs, qls, 64, seed=3)
++    scale = 1.0 / math.sqrt(D)
++    out = torch.empty_like(q)
++    sl_g, bt_g, q_g = sl.clone(), bt.clone(), q.clone()
++    k8v4_decode(q_g, cache, bt_g, sl_g, out, scale, q_len_per_req=4)  # warm/compile
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        k8v4_decode(q_g, cache, bt_g, sl_g, out, scale, q_len_per_req=4)
++    for step in range(3):
++        sl_g.copy_((sl - step * 7).clamp_min(4))
++        q_g.copy_((torch.randn_like(q.float()) * 2).to(q.dtype))
++        g.replay()
++        torch.cuda.synchronize()
++        eager = torch.empty_like(q)
++        k8v4_decode(q_g, cache, bt_g, sl_g, eager, scale, q_len_per_req=4)
++        assert torch.equal(out, eager)
++
++
++@pytest.mark.parametrize("page", [16, 64])
++def test_gather_pages(page):
++    cache = _make_cache(40, page)
++    # valid caches only: write real data so scales are finite
++    k, v = _kv(40 * page, seed=11)
++    slots = torch.arange(40 * page, device=DEV)
++    k8v4_store(k, v, cache, slots, torch.tensor(1.0, device=DEV),
++               torch.tensor(1.0, device=DEV))
++    ids = torch.tensor([7, 3, 39, 1, 3], dtype=torch.int32, device=DEV)
++    kf, vf = k8v4_read_cache_ref(cache, D)
++    gk, gv = k8v4_gather_pages(cache, ids, D, FP8_DTYPE)
++    assert torch.equal(gk.float().to(torch.bfloat16), kf[ids.long()])
++    exp_v = vf[ids.long()].float().clamp(-448, 448).to(FP8_DTYPE)
++    assert torch.equal(gv.view(torch.uint8), exp_v.view(torch.uint8))
++    bk, bv = k8v4_gather_pages(cache, ids, D, torch.bfloat16)
++    assert torch.equal(bk, kf[ids.long()]) and torch.equal(bv, vf[ids.long()])
++
++
++def test_mock_paged():
++    page = 64
++    cache = _make_cache(30, page)
++    k, v = _kv(30 * page, seed=5)
++    k8v4_store(k, v, cache, torch.arange(30 * page, device=DEV),
++               torch.tensor(1.0, device=DEV), torch.tensor(1.0, device=DEV))
++    bt = torch.tensor([[4, 9, 2, 0], [11, 0, 0, 0]], dtype=torch.int32, device=DEV)
++    sl = torch.tensor([150, 10], dtype=torch.int32, device=DEV)
++    mock, mbt = k8v4_mock_paged(cache, bt, sl, 150, D)
++    assert mbt.shape == (2, 3)
++    kf, vf = k8v4_read_cache_ref(cache, D)
++    for b, npg in ((0, 3), (1, 1)):
++        for j in range(npg):
++            src = int(bt[b, j])
++            dst = int(mbt[b, j])
++            assert torch.equal(mock[dst, 0].float().to(torch.bfloat16), kf[src])
++            exp_v = vf[src].float().clamp(-448, 448).to(FP8_DTYPE)
++            assert torch.equal(mock[dst, 1].view(torch.uint8), exp_v.view(torch.uint8))
+diff --git a/vllm/v1/attention/ops/k8v4_kv.py b/vllm/v1/attention/ops/k8v4_kv.py
+new file mode 100644
+index 000000000..f198b0f03
+--- /dev/null
++++ b/vllm/v1/attention/ops/k8v4_kv.py
+@@ -0,0 +1,705 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""K8V4 KV cache (`--kv-cache-dtype k8v4`): FP8 E4M3 keys, NVFP4 values.
++
++Values are E2M1 with one E4M3 block scale per 16 contiguous elements of a head
++vector and a per-layer global scale (the layer's v_scale, 1.0 when the
++checkpoint has none). Keys are per-tensor FP8 (the layer's k_scale).
++
++Page layout. The cache spec has one slot per KV head and
++`head_size + head_size // 2 + head_size // 16` bytes per (head, token), so a
++kernel page holds `H * P * (D + D/2 + D/16)` bytes. The bytes of each page are
++split into three planes (the layout must keep each page's [H, N, C] bytes
++contiguous, i.e. an HND layout):
++
++    [ K   : H x P x D      fp8 e4m3 ]
++    [ V   : H x P x D/2    uint8, two E2M1 codes per byte, low nibble first ]
++    [ Vsf : H x P x D/16   fp8 e4m3 block scales ]
++
++Numerics reproduce the QW38 accuracy emulation (FP8 keys, NVFP4 values):
++keys `fp8(clamp(k / k_scale, +-448))`; values per 16 elements of `x / g`:
++`bs = fp8(min(amax / 6, 448))`, `y = clamp(b / bs, +-6)` (IEEE division),
++E2M1 rounding `|y| < 2: rint(2|y|)/2; < 4: rint(|y|); < 5: 4; else 6`
++(half-even, and 5.0 rounds up to 6 as in the emulation), dequant
++`bf16((e2m1 * bs) * g)`. Dequantized values are exact in BF16 (<= 6
++significant bits) when g == 1.
++
++Kernels (Triton, no csrc):
++  * `k8v4_store`: reshape_and_cache writer (slot mapping).
++  * `k8v4_decode`: split-KV decode / multi-token verify (causal within the
++    request's new tokens), BF16 Q, BF16 math on exactly dequantized K/V,
++    FP32 softmax and accumulation.
++  * `k8v4_gather_pages` / `k8v4_mock_paged`: copy K pages and dequantize V
++    pages to FP8 (or BF16) dense pages for the FP8 prefill FMHAs (SM120
++    cute-dsl-prims, SM100 trtllm-gen context). With an FP8 output V is
++    re-rounded to E4M3 (the prefill FMHA computes PV in FP8).
++"""
++
++import os
++
++import torch
++
++from vllm.triton_utils import tl, tldevice, triton
++
++FP8_DTYPE = torch.float8_e4m3fn
++
++
++def k8v4_head_bytes(head_size: int) -> int:
++    """Bytes per (KV head, token): fp8 K + packed fp4 V + fp8 V block scales."""
++    assert head_size % 32 == 0, head_size
++    return head_size + head_size // 2 + head_size // 16
++
++
++def k8v4_planes(
++    kv_cache: torch.Tensor, head_size: int
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Plane views of a per-layer K8V4 cache `[num_blocks, H, P, C]` (uint8).
++
++    Returns (k [NB, H, P, D] uint8, v [NB, H, P, D/2] uint8,
++    v_sf [NB, H, P, D/16] uint8); all share the page stride of `kv_cache`.
++    """
++    if kv_cache.dtype != torch.uint8:
++        kv_cache = kv_cache.view(torch.uint8)
++    nb, h, p, c = kv_cache.shape
++    d = head_size
++    assert c == k8v4_head_bytes(d), (c, d)
++    if kv_cache.stride()[1:] != (p * c, c, 1):
++        raise ValueError(
++            "K8V4 KV cache pages must be HND-contiguous ([H, N, C] per page), "
++            f"got strides {kv_cache.stride()} for shape {tuple(kv_cache.shape)}"
++        )
++    page = kv_cache.stride(0)
++    base = kv_cache.storage_offset()
++    k = torch.as_strided(kv_cache, (nb, h, p, d), (page, p * d, d, 1), base)
++    v = torch.as_strided(
++        kv_cache, (nb, h, p, d // 2), (page, p * d // 2, d // 2, 1), base + h * p * d
++    )
++    vs = torch.as_strided(
++        kv_cache,
++        (nb, h, p, d // 16),
++        (page, p * d // 16, d // 16, 1),
++        base + h * p * (d + d // 2),
++    )
++    return k, v, vs
++
++
++# ---------------------------------------------------------------------------
++# Shared device helpers
++# ---------------------------------------------------------------------------
++
++
++@triton.jit
++def _e2m1_to_f32(c):
++    """E2M1 code (int32, 0..15, bit 3 = sign) -> fp32 value."""
++    mag = c & 7
++    e = mag >> 1
++    m = (mag & 1).to(tl.float32)
++    pw = (1 << tl.maximum(e - 1, 0)).to(tl.float32)
++    val = tl.where(e == 0, m * 0.5, (1.0 + m * 0.5) * pw)
++    return tl.where((c & 8) != 0, -val, val)
++
++
++@triton.jit
++def _dequant_v_tile(vd, vsc, g, HEAD_DIM: tl.constexpr, ROWS: tl.constexpr):
++    """[ROWS, D/2] packed codes (int32) + [ROWS, D/16] fp32 scales -> [ROWS, D]
++    fp32 values `(e2m1 * bs) * g`."""
++    lo = _e2m1_to_f32(vd & 15)
++    hi = _e2m1_to_f32((vd >> 4) & 15)
++    sc = tl.reshape(
++        tl.broadcast_to(vsc[:, :, None], [ROWS, HEAD_DIM // 16, 8]),
++        [ROWS, HEAD_DIM // 2],
++    )
++    lo = (lo * sc) * g
++    hi = (hi * sc) * g
++    return tl.reshape(tl.join(lo, hi), [ROWS, HEAD_DIM])
++
++
++# ---------------------------------------------------------------------------
++# Writer
++# ---------------------------------------------------------------------------
++
++
++@triton.jit
++def _k8v4_store_kernel(
++    key_ptr,
++    value_ptr,
++    k_ptr,
++    vd_ptr,
++    vs_ptr,
++    slot_ptr,
++    k_scale_ptr,
++    v_scale_ptr,
++    stride_kt,
++    stride_kh,
++    stride_vt,
++    stride_vh,
++    page_stride,
++    HEAD_DIM: tl.constexpr,
++    PAGE: tl.constexpr,
++):
++    t = tl.program_id(0)
++    h = tl.program_id(1)
++    slot = tl.load(slot_ptr + t).to(tl.int64)
++    if slot < 0:
++        return
++    blk = slot // PAGE
++    off = slot % PAGE
++    row = h * PAGE + off
++    page_base = blk * page_stride
++
++    d = tl.arange(0, HEAD_DIM)
++    ks = tl.load(k_scale_ptr).to(tl.float32)
++    vg = tl.load(v_scale_ptr).to(tl.float32)
++
++    # Keys: per-tensor FP8, saturating.
++    k = tl.load(key_ptr + t * stride_kt + h * stride_kh + d).to(tl.float32)
++    k8 = tl.clamp(tl.math.div_rn(k, ks), -448.0, 448.0).to(tl.float8e4nv)
++    tl.store(k_ptr + page_base + row * HEAD_DIM + d, k8.to(tl.uint8, bitcast=True))
++
++    # Values: NVFP4 per 16 elements (emulation-exact rounding).
++    v = tl.load(value_ptr + t * stride_vt + h * stride_vh + d).to(tl.float32)
++    b = tl.reshape(tl.math.div_rn(v, vg), [HEAD_DIM // 16, 16])
++    amax = tl.max(tl.abs(b), axis=1)
++    bs = tl.minimum(tl.math.div_rn(amax, 6.0), 448.0).to(tl.float8e4nv)
++    bsf = bs.to(tl.float32)
++    safe = tl.where(bsf == 0.0, 1.0, bsf)
++    y = tl.clamp(tl.math.div_rn(b, safe[:, None]), -6.0, 6.0)
++    a = tl.abs(y)
++    code = tl.where(
++        a < 2.0,
++        tldevice.rint(a * 2.0),
++        tl.where(a < 4.0, tldevice.rint(a) + 2.0, tl.where(a < 5.0, 6.0, 7.0)),
++    ).to(tl.int32)
++    code = code | tl.where(y < 0.0, 8, 0)
++    lo, hi = tl.split(tl.reshape(code, [HEAD_DIM // 2, 2]))
++    packed = (lo | (hi << 4)).to(tl.uint8)
++    dh = tl.arange(0, HEAD_DIM // 2)
++    tl.store(vd_ptr + page_base + row * (HEAD_DIM // 2) + dh, packed)
++    ds = tl.arange(0, HEAD_DIM // 16)
++    tl.store(
++        vs_ptr + page_base + row * (HEAD_DIM // 16) + ds,
++        bs.to(tl.uint8, bitcast=True),
++    )
++
++
++def k8v4_store(
++    key: torch.Tensor,
++    value: torch.Tensor,
++    kv_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    k_scale: torch.Tensor,
++    v_scale: torch.Tensor,
++) -> None:
++    """Quantize and write `key`/`value` [T, H, D] at `slot_mapping` [T'] (T' <= T;
++    negative slots are skipped)."""
++    num_tokens = slot_mapping.shape[0]
++    if num_tokens == 0:
++        return
++    head_size = key.shape[-1]
++    num_kv_heads = key.shape[-2]
++    k, vd, vs = k8v4_planes(kv_cache, head_size)
++    assert key.stride(-1) == 1 and value.stride(-1) == 1
++    _k8v4_store_kernel[(num_tokens, num_kv_heads)](
++        key,
++        value,
++        k,
++        vd,
++        vs,
++        slot_mapping,
++        k_scale,
++        v_scale,
++        key.stride(0),
++        key.stride(1),
++        value.stride(0),
++        value.stride(1),
++        k.stride(0),
++        HEAD_DIM=head_size,
++        PAGE=k.shape[2],
++        num_warps=4,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Decode / verify
++# ---------------------------------------------------------------------------
++
++
++@triton.jit
++def _k8v4_decode_stage1(
++    q_ptr,
++    stride_qt,
++    stride_qh,
++    k_ptr,
++    vd_ptr,
++    vs_ptr,
++    page_stride,
++    bt_ptr,
++    stride_bt,
++    seqlen_ptr,
++    qcu_ptr,
++    mid_o_ptr,
++    mid_l_ptr,
++    out_ptr,
++    stride_ot,
++    stride_oh,
++    qk_scale_log2,
++    v_scale,
++    NUM_Q_HEADS: tl.constexpr,
++    GROUP: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    PAGE: tl.constexpr,
++    NUM_SPLITS: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    QLEN: tl.constexpr,
++    RAGGED: tl.constexpr,
++):
++    b = tl.program_id(0)
++    kvh = tl.program_id(1)
++    sp = tl.program_id(2)
++
++    seq_len = tl.load(seqlen_ptr + b)
++    if RAGGED:
++        q0 = tl.load(qcu_ptr + b)
++        ql = tl.load(qcu_ptr + b + 1) - q0
++    else:
++        q0 = b * QLEN
++        ql = QLEN
++
++    rows = tl.arange(0, BLOCK_M)
++    tq = rows // GROUP
++    qh = kvh * GROUP + rows % GROUP
++    row_ok = tq < ql
++    trow = (q0 + tq).to(tl.int64)
++    d = tl.arange(0, HEAD_DIM)
++    q = tl.load(
++        q_ptr + trow[:, None] * stride_qt + qh[:, None] * stride_qh + d[None, :],
++        mask=row_ok[:, None],
++        other=0.0,
++    ).to(tl.bfloat16)
++    qpos = seq_len - ql + tq
++
++    num_pages = tl.cdiv(seq_len, PAGE)
++    pps = tl.cdiv(num_pages, NUM_SPLITS)
++    p_start = sp * pps
++    p_end = tl.minimum(p_start + pps, num_pages)
++
++    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
++    l_i = tl.zeros([BLOCK_M], tl.float32)
++    acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
++
++    n = tl.arange(0, PAGE)
++    dh = tl.arange(0, HEAD_DIM // 2)
++    ds = tl.arange(0, HEAD_DIM // 16)
++    krow = (kvh * PAGE + n).to(tl.int64)
++    bt_row = bt_ptr + b.to(tl.int64) * stride_bt
++    for p in range(p_start, p_end):
++        blk = tl.load(bt_row + p).to(tl.int64)
++        base = blk * page_stride
++        kvpos = p * PAGE + n
++        kv_ok = kvpos < seq_len
++        kt = tl.load(
++            k_ptr + base + krow[:, None] * HEAD_DIM + d[None, :],
++            mask=kv_ok[:, None],
++            other=0,
++        )
++        kt = kt.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
++        s = tl.dot(q, tl.trans(kt)) * qk_scale_log2
++        allowed = (kvpos[None, :] <= qpos[:, None]) & kv_ok[None, :]
++        s = tl.where(allowed, s, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.exp2(m_i - m_safe)
++        pm = tl.exp2(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(pm, 1)
++
++        vd = tl.load(
++            vd_ptr + base + krow[:, None] * (HEAD_DIM // 2) + dh[None, :],
++            mask=kv_ok[:, None],
++            other=0,
++        ).to(tl.int32)
++        vsc = tl.load(
++            vs_ptr + base + krow[:, None] * (HEAD_DIM // 16) + ds[None, :],
++            mask=kv_ok[:, None],
++            other=0,
++        )
++        vsc = vsc.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++        v = _dequant_v_tile(vd, vsc, v_scale, HEAD_DIM, PAGE).to(tl.bfloat16)
++        acc = acc * alpha[:, None] + tl.dot(pm.to(tl.bfloat16), v)
++        m_i = m_new
++
++    has = l_i > 0.0
++    o = acc / tl.where(has, l_i, 1.0)[:, None]
++    if NUM_SPLITS == 1:
++        tl.store(
++            out_ptr + trow[:, None] * stride_ot + qh[:, None] * stride_oh + d[None, :],
++            o.to(out_ptr.dtype.element_ty),
++            mask=row_ok[:, None],
++        )
++    else:
++        lse = tl.where(has, m_i + tl.log2(tl.where(has, l_i, 1.0)), float("-inf"))
++        mid = (trow * NUM_Q_HEADS + qh) * NUM_SPLITS + sp
++        tl.store(mid_l_ptr + mid, lse, mask=row_ok)
++        tl.store(
++            mid_o_ptr + mid[:, None] * HEAD_DIM + d[None, :],
++            o,
++            mask=row_ok[:, None] & has[:, None],
++        )
++
++
++@triton.jit
++def _k8v4_decode_stage2(
++    mid_o_ptr,
++    mid_l_ptr,
++    out_ptr,
++    stride_ot,
++    stride_oh,
++    NUM_Q_HEADS: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    NUM_SPLITS: tl.constexpr,
++    SPLITS_P2: tl.constexpr,
++):
++    t = tl.program_id(0).to(tl.int64)
++    h = tl.program_id(1)
++    s = tl.arange(0, SPLITS_P2)
++    base = (t * NUM_Q_HEADS + h) * NUM_SPLITS
++    lse = tl.load(mid_l_ptr + base + s, mask=s < NUM_SPLITS, other=float("-inf"))
++    mx = tl.max(lse, 0)
++    mx = tl.where(mx == float("-inf"), 0.0, mx)
++    w = tl.exp2(lse - mx)
++    den = tl.sum(w, 0)
++    d = tl.arange(0, HEAD_DIM)
++    o = tl.load(
++        mid_o_ptr + (base + s)[:, None] * HEAD_DIM + d[None, :],
++        mask=(lse > float("-inf"))[:, None],
++        other=0.0,
++    )
++    res = tl.sum(w[:, None] * o, 0) / tl.where(den > 0.0, den, 1.0)
++    tl.store(
++        out_ptr + t * stride_ot + h * stride_oh + d, res.to(out_ptr.dtype.element_ty)
++    )
++
++
++_SM_COUNT: dict[int, int] = {}
++
++
++def _num_sms(device: torch.device) -> int:
++    idx = device.index if device.index is not None else torch.cuda.current_device()
++    if idx not in _SM_COUNT:
++        _SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
++    return _SM_COUNT[idx]
++
++
++def k8v4_num_splits(num_reqs: int, num_kv_heads: int, device: torch.device) -> int:
++    """Static split count (a function of the padded batch only, so CUDA-graph
++    replays keep the captured grid). VLLM_K8V4_DECODE_SPLITS overrides."""
++    env = os.environ.get("VLLM_K8V4_DECODE_SPLITS")
++    if env:
++        return max(1, int(env))
++    target = 2 * _num_sms(device)
++    return max(1, min(64, triton.cdiv(target, max(1, num_reqs * num_kv_heads))))
++
++
++def k8v4_decode(
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    block_tables: torch.Tensor,
++    seq_lens: torch.Tensor,
++    out: torch.Tensor,
++    sm_scale: float,
++    k_scale: float = 1.0,
++    v_scale: float = 1.0,
++    q_len_per_req: int = 1,
++    q_cu_seq_lens: torch.Tensor | None = None,
++    num_splits: int | None = None,
++    block_m: int | None = None,
++    num_warps: int = 4,
++    num_stages: int = 2,
++) -> torch.Tensor:
++    """Decode / verify attention over a K8V4 cache.
++
++    query: [T, Hq, D] (BF16/FP16); out: [T, Hq, D] or [T, Hq*D].
++    Requests are `block_tables.shape[0]`; request b owns query rows
++    `[b*q_len_per_req, (b+1)*q_len_per_req)` or `q_cu_seq_lens[b:b+2]` when
++    given (ragged; `q_len_per_req` is then the max query length). Query row i
++    of a request with `L` rows and `seq_lens[b] = S` (including the new rows)
++    attends to KV positions `<= S - L + i`.
++    """
++    num_tokens, num_q_heads, head_size = query.shape
++    num_reqs = block_tables.shape[0]
++    k, vd, vs = k8v4_planes(kv_cache, head_size)
++    num_kv_heads, page = k.shape[1], k.shape[2]
++    group = num_q_heads // num_kv_heads
++    out3 = out.view(out.shape[0], num_q_heads, head_size)
++    if num_tokens == 0 or num_reqs == 0:
++        return out
++    if num_splits is None:
++        num_splits = k8v4_num_splits(num_reqs, num_kv_heads, query.device)
++    if block_m is None:
++        block_m = max(16, triton.next_power_of_2(q_len_per_req * group))
++    assert block_m >= q_len_per_req * group
++    ragged = q_cu_seq_lens is not None
++    if num_splits > 1:
++        mid_l = torch.empty(
++            (num_tokens, num_q_heads, num_splits), dtype=torch.float32, device=query.device
++        )
++        if ragged:
++            mid_l.fill_(float("-inf"))
++        mid_o = torch.empty(
++            (num_tokens, num_q_heads, num_splits, head_size),
++            dtype=torch.float32,
++            device=query.device,
++        )
++    else:
++        mid_l = mid_o = out3  # unused
++    _k8v4_decode_stage1[(num_reqs, num_kv_heads, num_splits)](
++        query,
++        query.stride(0),
++        query.stride(1),
++        k,
++        vd,
++        vs,
++        k.stride(0),
++        block_tables,
++        block_tables.stride(0),
++        seq_lens,
++        q_cu_seq_lens if ragged else seq_lens,
++        mid_o,
++        mid_l,
++        out3,
++        out3.stride(0),
++        out3.stride(1),
++        float(sm_scale * k_scale * 1.4426950408889634),
++        float(v_scale),
++        NUM_Q_HEADS=num_q_heads,
++        GROUP=group,
++        HEAD_DIM=head_size,
++        PAGE=page,
++        NUM_SPLITS=num_splits,
++        BLOCK_M=block_m,
++        QLEN=q_len_per_req,
++        RAGGED=ragged,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++    if num_splits > 1:
++        _k8v4_decode_stage2[(num_tokens, num_q_heads)](
++            mid_o,
++            mid_l,
++            out3,
++            out3.stride(0),
++            out3.stride(1),
++            NUM_Q_HEADS=num_q_heads,
++            HEAD_DIM=head_size,
++            NUM_SPLITS=num_splits,
++            SPLITS_P2=triton.next_power_of_2(num_splits),
++            num_warps=4,
++        )
++    return out
++
++
++# ---------------------------------------------------------------------------
++# Prefill: dense FP8 (or BF16) pages for the FP8 prefill FMHAs
++# ---------------------------------------------------------------------------
++
++
++@triton.jit
++def _k8v4_gather_kernel(
++    k_ptr,
++    vd_ptr,
++    vs_ptr,
++    page_stride,
++    ids_ptr,
++    stride_ids,
++    seqlen_ptr,
++    out_k_ptr,
++    out_v_ptr,
++    out_page_stride,
++    num_cols,
++    v_scale,
++    NUM_KV_HEADS: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    PAGE: tl.constexpr,
++    OUT_BASE: tl.constexpr,
++    CHECK_LEN: tl.constexpr,
++    OUT_FP8: tl.constexpr,
++):
++    b = tl.program_id(0)
++    j = tl.program_id(1)
++    h = tl.program_id(2)
++    if CHECK_LEN:
++        if j * PAGE >= tl.load(seqlen_ptr + b):
++            return
++    blk = tl.load(ids_ptr + b.to(tl.int64) * stride_ids + j).to(tl.int64)
++    base = blk * page_stride
++    out_page = (OUT_BASE + b.to(tl.int64) * num_cols + j).to(tl.int64)
++    obase = out_page * out_page_stride + h * (PAGE * HEAD_DIM)
++
++    n = tl.arange(0, PAGE)
++    d = tl.arange(0, HEAD_DIM)
++    row = (h * PAGE + n).to(tl.int64)
++    kt = tl.load(k_ptr + base + row[:, None] * HEAD_DIM + d[None, :])
++    kt = kt.to(tl.float8e4nv, bitcast=True)
++    if OUT_FP8:
++        tl.store(out_k_ptr + obase + n[:, None] * HEAD_DIM + d[None, :], kt)
++    else:
++        tl.store(
++            out_k_ptr + obase + n[:, None] * HEAD_DIM + d[None, :],
++            kt.to(out_k_ptr.dtype.element_ty),
++        )
++    dh = tl.arange(0, HEAD_DIM // 2)
++    ds = tl.arange(0, HEAD_DIM // 16)
++    vd = tl.load(vd_ptr + base + row[:, None] * (HEAD_DIM // 2) + dh[None, :]).to(
++        tl.int32
++    )
++    vsc = tl.load(vs_ptr + base + row[:, None] * (HEAD_DIM // 16) + ds[None, :])
++    vsc = vsc.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    if OUT_FP8:
++        # e2m1 * bs (the global scale stays outside, as the FMHA's v_scale)
++        v = _dequant_v_tile(vd, vsc, 1.0, HEAD_DIM, PAGE)
++        v = tl.clamp(v, -448.0, 448.0).to(tl.float8e4nv)
++    else:
++        v = _dequant_v_tile(vd, vsc, v_scale, HEAD_DIM, PAGE)
++        v = v.to(out_v_ptr.dtype.element_ty)
++    tl.store(out_v_ptr + obase + n[:, None] * HEAD_DIM + d[None, :], v)
++
++
++def k8v4_gather_pages(
++    kv_cache: torch.Tensor,
++    page_ids: torch.Tensor,
++    head_size: int,
++    out_dtype: torch.dtype = FP8_DTYPE,
++    v_scale: float = 1.0,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Dense `[n, H, P, D]` K and V pages for `page_ids` [n]. FP8 output: K
++    copied, V = fp8(e2m1 * bs) (apply v_scale in the FMHA); BF16 output: exact
++    dequantization `(e2m1 * bs) * v_scale` (K not scaled)."""
++    k, vd, vs = k8v4_planes(kv_cache, head_size)
++    n = page_ids.shape[0]
++    h, p = k.shape[1], k.shape[2]
++    out_k = torch.empty((n, h, p, head_size), dtype=out_dtype, device=k.device)
++    out_v = torch.empty_like(out_k)
++    if n == 0:
++        return out_k, out_v
++    _k8v4_gather_kernel[(1, n, h)](
++        k,
++        vd,
++        vs,
++        k.stride(0),
++        page_ids,
++        0,
++        page_ids,
++        out_k,
++        out_v,
++        h * p * head_size,
++        n,
++        float(v_scale),
++        NUM_KV_HEADS=h,
++        HEAD_DIM=head_size,
++        PAGE=p,
++        OUT_BASE=0,
++        CHECK_LEN=False,
++        OUT_FP8=out_dtype == FP8_DTYPE,
++        num_warps=4,
++    )
++    return out_k, out_v
++
++
++def k8v4_mock_paged(
++    kv_cache: torch.Tensor,
++    block_tables: torch.Tensor,
++    seq_lens: torch.Tensor,
++    max_seq_len: int,
++    head_size: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """FP8 mock cache `[1 + B*J, 2, H, P, D]` (HND) + mock block table [B, J]
++    (J = pages of the longest request) for the SM100 trtllm-gen context
++    kernel. Page 0 is never written (pages past a request's length are
++    skipped and never read)."""
++    k, vd, vs = k8v4_planes(kv_cache, head_size)
++    h, p = k.shape[1], k.shape[2]
++    num_reqs = block_tables.shape[0]
++    cols = max(1, triton.cdiv(max_seq_len, p))
++    mock = torch.empty(
++        (1 + num_reqs * cols, 2, h, p, head_size), dtype=FP8_DTYPE, device=k.device
++    )
++    mock_bt = (
++        torch.arange(
++            1, 1 + num_reqs * cols, dtype=block_tables.dtype, device=k.device
++        ).view(num_reqs, cols)
++    )
++    if num_reqs == 0:
++        return mock, mock_bt
++    _k8v4_gather_kernel[(num_reqs, cols, h)](
++        k,
++        vd,
++        vs,
++        k.stride(0),
++        block_tables,
++        block_tables.stride(0),
++        seq_lens,
++        mock[:, 0],
++        mock[:, 1],
++        mock.stride(0),
++        cols,
++        1.0,
++        NUM_KV_HEADS=h,
++        HEAD_DIM=head_size,
++        PAGE=p,
++        OUT_BASE=1,
++        CHECK_LEN=True,
++        OUT_FP8=True,
++        num_warps=4,
++    )
++    return mock, mock_bt
++
++
++# ---------------------------------------------------------------------------
++# PyTorch references (the QW38 emulation's quantizers; tests)
++# ---------------------------------------------------------------------------
++
++
++def _fp4_round_ref(a: torch.Tensor) -> torch.Tensor:
++    return torch.where(
++        a < 2,
++        torch.round(a * 2) / 2,
++        torch.where(
++            a < 4,
++            torch.round(a),
++            torch.where(a < 5, torch.full_like(a, 4.0), torch.full_like(a, 6.0)),
++        ),
++    )
++
++
++def qdq_fp8_ref(x: torch.Tensor, s: float) -> torch.Tensor:
++    """Reference FP8 (E4M3, per-tensor scale s) quantize-dequantize."""
++    y = (x.float() / s).clamp(-448.0, 448.0).to(FP8_DTYPE).float() * s
++    return y.to(x.dtype)
++
++
++def qdq_nvfp4_ref(x: torch.Tensor, g: float) -> torch.Tensor:
++    """Reference NVFP4 (E2M1, 16-element blocks, FP8 block scales) quantize-dequantize."""
++    shp = x.shape
++    b = x.float().reshape(shp[0], -1, 16) / g
++    bs = (b.abs().amax(-1, keepdim=True) / 6.0).clamp(max=448.0).to(FP8_DTYPE).float()
++    safe = torch.where(bs == 0, torch.ones_like(bs), bs)
++    y = (b / safe).clamp(-6.0, 6.0)
++    q = torch.sign(y) * _fp4_round_ref(y.abs())
++    return (q * bs * g).reshape(shp).to(x.dtype)
++
++
++def k8v4_read_cache_ref(
++    kv_cache: torch.Tensor, head_size: int, v_scale: float = 1.0, k_scale: float = 1.0
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Decode a whole K8V4 cache in PyTorch: ([NB, H, P, D], [NB, H, P, D]) BF16."""
++    k, vd, vs = k8v4_planes(kv_cache, head_size)
++    kf = (k.view(FP8_DTYPE).float() * k_scale).to(torch.bfloat16)
++    lut = torch.tensor(
++        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
++        dtype=torch.float32,
++        device=k.device,
++    )
++    codes = torch.stack([vd & 15, vd >> 4], dim=-1).flatten(-2).long()
++    vals = lut[codes]
++    sc = vs.view(FP8_DTYPE).float().repeat_interleave(16, dim=-1)
++    vf = ((vals * sc) * v_scale).to(torch.bfloat16)
++    return kf, vf

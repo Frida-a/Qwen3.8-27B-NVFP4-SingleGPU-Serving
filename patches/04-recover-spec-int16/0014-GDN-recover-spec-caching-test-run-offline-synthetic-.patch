@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:29:58 -0800
+Subject: [PATCH] [GDN] recover spec caching test: run offline (synthetic local
+ config)
+
+The scheduler-level cache comparison only needs a model config: write a tiny
+Qwen3 config.json to a tmp dir and skip tokenizer init instead of fetching
+Qwen/Qwen3-0.6B, so the test runs in offline containers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../core/test_mamba_recover_spec_caching.py   | 37 ++++++++++++++++---
+ 1 file changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/core/test_mamba_recover_spec_caching.py b/tests/v1/core/test_mamba_recover_spec_caching.py
+index 5fa714700..72418318b 100644
+--- a/tests/v1/core/test_mamba_recover_spec_caching.py
++++ b/tests/v1/core/test_mamba_recover_spec_caching.py
+@@ -10,6 +10,7 @@ which grows the page and therefore the hybrid block size; W = 1 keeps the
+ page identical to the per-token path's.)
+ """
+ 
++import json
+ import random
+ 
+ import pytest
+@@ -42,9 +43,35 @@ def _request(req_id: str, prompt: list[int], max_tokens: int) -> Request:
+     )
+ 
+ 
+-def _run(num_speculative_blocks: int, prompt_len: int, accepted: list[int]):
++@pytest.fixture(scope="module")
++def tiny_model(tmp_path_factory) -> str:
++    """A minimal local HF config (no weights, no tokenizer): the scheduler only
++    needs a model config, so the test runs offline."""
++    path = tmp_path_factory.mktemp("tiny_qwen3")
++    config = {
++        "architectures": ["Qwen3ForCausalLM"],
++        "model_type": "qwen3",
++        "hidden_size": 64,
++        "intermediate_size": 128,
++        "num_hidden_layers": 2,
++        "num_attention_heads": 4,
++        "num_key_value_heads": 2,
++        "head_dim": 16,
++        "vocab_size": 4096,
++        "max_position_embeddings": 4096,
++        "rms_norm_eps": 1e-6,
++        "rope_theta": 10000.0,
++        "torch_dtype": "bfloat16",
++        "tie_word_embeddings": True,
++    }
++    (path / "config.json").write_text(json.dumps(config))
++    return str(path)
++
++
++def _run(model: str, num_speculative_blocks: int, prompt_len: int, accepted: list[int]):
+     scheduler = create_scheduler(
+-        model="Qwen/Qwen3-0.6B",
++        model=model,
++        skip_tokenizer_init=True,
+         enable_prefix_caching=True,
+         num_speculative_tokens=NUM_SPEC,
+         speculative_method="ngram_gpu",
+@@ -100,11 +127,11 @@ def _run(num_speculative_blocks: int, prompt_len: int, accepted: list[int]):
+ 
+ @pytest.mark.parametrize("seed", range(4))
+ @pytest.mark.parametrize("prompt_len", [37, 45, 64])
+-def test_recover_caches_same_blocks_as_per_token(seed, prompt_len):
++def test_recover_caches_same_blocks_as_per_token(tiny_model, seed, prompt_len):
+     rng = random.Random(seed)
+     accepted = [rng.randint(1, NUM_SPEC + 1) for _ in range(25)]
+-    per_token = _run(NUM_SPEC, prompt_len, accepted)
+-    recover = _run(0, prompt_len, accepted)
++    per_token = _run(tiny_model, NUM_SPEC, prompt_len, accepted)
++    recover = _run(tiny_model, 0, prompt_len, accepted)
+     cached_pt, hit_pt, n_tokens = per_token
+     cached_rec, hit_rec, _ = recover
+     # Decode crossed block boundaries and published some of them.

@@ -1,0 +1,1305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 13:43:35 -0800
+Subject: [PATCH] [QW38] gdn recover fold: deferred commit into the next verify
+ (D1, VLLM_GDN_RECOVER_FOLD=1)
+
+VLLM_GDN_SPEC_STATE=recover (W = 1) folds each step's accepted records in a
+post-sampling commit that re-reads and re-writes every state (verify R +
+commit R+W per step). With VLLM_GDN_RECOVER_FOLD=1 the post-sampling commit
+only records (ring half, accepted count) per request; the next verify folds
+those records in registers (same replay and int16 quantizer), stores the
+committed state in place, continues from the exact reload values and writes
+this step's records into the other ring half: R+W per step, no commit pass.
+
+- Records: per-layer side buffer keyed by the runner's request-table row
+  (CommonAttentionMetadata.req_idx; mamba_hybrid now passes it), R = 2(k+1).
+- Trackers per cache group; reset at request admission (add_request) and for
+  non-spec (prefill) rows; a missing req_idx is a hard error.
+- Align mode: rows whose accepted tokens reach a block boundary are still
+  folded eagerly after sampling (boundary block + running state complete
+  before caching/migration), via the commit kernel with a record row in the
+  plan.
+- Off by default. Test: tests/kernels/mamba/test_gdn_recover_fold.py
+  (bit-exact vs the eager commit over multi-step simulations).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/mamba/test_gdn_recover_fold.py  | 365 +++++++++++++++++
+ vllm/envs.py                                  |   8 +
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  |  21 +-
+ .../layers/mamba/mamba_utils.py               |  10 +
+ .../layers/mamba/ops/gdn_recover_spec.py      | 371 ++++++++++++++++--
+ vllm/v1/attention/backends/gdn_attn.py        | 102 ++++-
+ .../worker/gpu/model_states/mamba_hybrid.py   |  17 +
+ 7 files changed, 854 insertions(+), 40 deletions(-)
+ create mode 100644 tests/kernels/mamba/test_gdn_recover_fold.py
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_fold.py b/tests/kernels/mamba/test_gdn_recover_fold.py
+new file mode 100644
+index 000000000..6566ca494
+--- /dev/null
++++ b/tests/kernels/mamba/test_gdn_recover_fold.py
+@@ -0,0 +1,365 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN recover deferred commit (VLLM_GDN_RECOVER_FOLD=1) vs the eager commit.
++
++Reference: the shipped recover path, per step `gdn_recover_verify` (per-step
++row records, W = 1) followed by `GDNRecoverCommitGroup.commit` after sampling.
++Fold: `gdn_recover_verify` with request-row records + deferred trackers (the
++verify folds the previous step's accepted records and stores the state in
++place) followed by `commit_deferred`.
++
++A multi-step simulation drives both with identical inputs and checks, bit for
++bit, at every step:
++  * verify outputs;
++  * the stored state of every verified request after the fold verify equals
++    the reference's committed state of the previous step;
++  * prefix-cache boundary blocks (align mode) right after the commit.
++It covers random row order across steps, mixed batches (row_indices), requests
++skipping steps with pending records, align-mode boundary crossings (also the
++"boundary block is the running block" case), request finish / admission /
++preemption-resume with request-row and slot reuse, padded rows, int16 and
++fp32 states, and eager vs CUDA-graph (verify captured once, replayed with
++persistent padded buffers) execution.
++"""
++
++import random
++import zlib
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.ops import gdn_recover_spec as grs
++from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++    GDNRecoverCommitGroup,
++    GDNRecoverDeferTrackers,
++    GDNRecoverRecords,
++    gdn_recover_defer_reset_requests,
++    gdn_recover_verify,
++)
++from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
++    gdn_int16_state_rows,
++    quantize_state_int16_ref,
++)
++
++if not torch.cuda.is_available():
++    pytest.skip("GDN recover kernels need CUDA", allow_module_level=True)
++
++DEV = "cuda"
++K = V = 128
++H, HV = 16, 48
++NUM_SPEC = 7
++L = 2  # GDN layers in the commit group
++MAX_REQS = 6  # request-table rows
++N_PAD = 8  # padded spec rows (graph mode)
++NSLOTS = 320
++BS = 8  # mamba block size (tokens) for align mode
++MAX_BLOCKS = 128
++
++
++def _bits(x):
++    return x.view({4: torch.int32, 2: torch.int16}[x.element_size()])
++
++
++def _eq(got, ref, what):
++    if not torch.equal(_bits(got), _bits(ref)):
++        n = int((_bits(got) != _bits(ref)).sum())
++        d = (got.float() - ref.float()).abs().max().item()
++        raise AssertionError(f"{what}: {n}/{got.numel()} differ, max {d:.3e}")
++
++
++class _Req:
++    def __init__(self, rid, row, run_slot, blocks, computed):
++        self.rid, self.row, self.run_slot = rid, row, run_slot
++        self.blocks, self.computed = blocks, computed
++
++
++class _Sim:
++    def __init__(self, fmt, graph, align, mixed, seed, reset=True):
++        self.fmt, self.graph, self.align, self.mixed = fmt, graph, align, mixed
++        self.reset = reset
++        self.rng = random.Random(seed)
++        self.gen = torch.Generator(device=DEV).manual_seed(seed)
++        grs._DEFER_TRACKERS.clear()
++        VP = gdn_int16_state_rows(V, K) if fmt == "int16_row" else V
++        sdt = torch.int16 if fmt == "int16_row" else torch.float32
++        self.VP, self.sdt = VP, sdt
++        self.ref_states = [
++            torch.zeros((NSLOTS, HV, VP, K), dtype=sdt, device=DEV) for _ in range(L)
++        ]
++        self.fold_states = [s.clone() for s in self.ref_states]
++        mk = dict(
++            num_k_heads=H,
++            num_v_heads=HV,
++            head_k_dim=K,
++            head_v_dim=V,
++            num_spec=NUM_SPEC,
++            dtype=torch.bfloat16,
++            device=DEV,
++        )
++        self.ref_rec = [
++            GDNRecoverRecords.allocate(num_slots=N_PAD, by_row=True, **mk)
++            for _ in range(L)
++        ]
++        self.fold_rec = [
++            GDNRecoverRecords.allocate(num_slots=MAX_REQS, by_req=True, **mk)
++            for _ in range(L)
++        ]
++        self.defer = GDNRecoverDeferTrackers.allocate(MAX_REQS, DEV)
++        self.ref_group = GDNRecoverCommitGroup(self.ref_states, self.ref_rec, H)
++        self.fold_group = GDNRecoverCommitGroup(
++            self.fold_states, self.fold_rec, H, defer=self.defer
++        )
++        self.A_log = [
++            torch.log(torch.rand(HV, generator=self.gen, device=DEV) * 15 + 1)
++            for _ in range(L)
++        ]
++        self.dt_bias = [torch.randn(HV, generator=self.gen, device=DEV) for _ in range(L)]
++        self.free_rows = list(range(MAX_REQS))
++        self.free_slots = list(range(1, NSLOTS))
++        self.reqs: dict[int, _Req] = {}
++        self.next_rid = 0
++        # Reference committed states of the previous step (per slot), to
++        # compare with the fold path's in-place store.
++        self.prev_ref = None
++        if graph:
++            self._init_graph()
++
++    # ---- request lifecycle -------------------------------------------------
++    def _prefill_state(self, slot):
++        x = torch.randn((HV, V, K), generator=self.gen, device=DEV) * 0.05
++        st = quantize_state_int16_ref(x) if self.fmt == "int16_row" else x
++        for s in self.ref_states + self.fold_states + (self.prev_ref or []):
++            s[slot] = st
++
++    def admit(self, row=None, reuse_slot=None):
++        if not self.free_rows:
++            return None
++        row = row if row is not None else self.rng.choice(self.free_rows)
++        self.free_rows.remove(row)
++        if reuse_slot is not None and reuse_slot in self.free_slots:
++            run_slot = reuse_slot
++        else:
++            run_slot = self.rng.choice(self.free_slots)
++        self.free_slots.remove(run_slot)
++        computed = self.rng.randrange(1, 40)
++        blocks = []
++        r = _Req(self.next_rid, row, run_slot, blocks, computed)
++        self.next_rid += 1
++        self.reqs[r.rid] = r
++        self._prefill_state(run_slot)
++        # The runner's add_request: drop records a predecessor left here.
++        if self.reset:
++            gdn_recover_defer_reset_requests(row)
++        return r
++
++    def free(self, r):
++        del self.reqs[r.rid]
++        self.free_rows.append(r.row)
++        self.free_slots.append(r.run_slot)
++        self.free_slots.extend(b for b in r.blocks if b != r.run_slot)
++
++    def _ensure_blocks(self, r, upto_tokens):
++        need = upto_tokens // BS + 1
++        while len(r.blocks) < need:
++            if self.rng.random() < 0.15 and r.run_slot not in r.blocks:
++                r.blocks.append(r.run_slot)  # boundary block == running block
++            else:
++                b = self.rng.choice(self.free_slots)
++                self.free_slots.remove(b)
++                r.blocks.append(b)
++
++    # ---- graph mode ------------------------------------------------------------
++    def _init_graph(self):
++        T_max = N_PAD * (NUM_SPEC + 1)
++        conv = 2 * H * K + HV * V
++        self.g_qkv = [torch.zeros((T_max, conv), dtype=torch.bfloat16, device=DEV) for _ in range(L)]
++        self.g_ba = [torch.zeros((T_max, 2 * HV), dtype=torch.bfloat16, device=DEV) for _ in range(L)]
++        self.g_out = [torch.zeros((T_max, HV, V), dtype=torch.bfloat16, device=DEV) for _ in range(L)]
++        self.g_cu = torch.zeros(N_PAD + 1, dtype=torch.int32, device=DEV)
++        self.g_slot = torch.zeros(N_PAD, dtype=torch.int32, device=DEV)
++        self.g_req = torch.zeros(N_PAD, dtype=torch.int32, device=DEV)
++        self.graphs = []
++
++        def run():
++            for i in range(L):
++                qkv, ba = self.g_qkv[i], self.g_ba[i]
++                gdn_recover_verify(
++                    qkv[:, : H * K].view(-1, H, K),
++                    qkv[:, H * K : 2 * H * K].view(-1, H, K),
++                    qkv[:, 2 * H * K :].view(-1, HV, V),
++                    ba[:, HV:],
++                    ba[:, :HV],
++                    self.A_log[i],
++                    self.dt_bias[i],
++                    self.fold_states[i],
++                    self.fold_rec[i],
++                    cu_seqlens=self.g_cu,
++                    slot_indices=self.g_slot,
++                    out=self.g_out[i],
++                    req_indices=self.g_req,
++                    defer=self.defer,
++                )
++
++        # Warm up (compile) on an all-padding batch, then capture.
++        run()
++        torch.cuda.synchronize()
++        g = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(g):
++            run()
++        self.graph_obj = g
++
++    # ---- one step ------------------------------------------------------------
++    def step(self):
++        rng = self.rng
++        # Lifecycle events.
++        live = list(self.reqs.values())
++        if live and rng.random() < 0.25:
++            r = rng.choice(live)
++            row, slot = r.row, r.run_slot
++            self.free(r)
++            if rng.random() < 0.5:
++                # Preemption/resume or immediate reuse: same request row and
++                # often the same running slot, while records are pending.
++                self.admit(row=row, reuse_slot=slot if rng.random() < 0.5 else None)
++        while len(self.reqs) < 3 or (self.free_rows and rng.random() < 0.3):
++            if self.admit() is None:
++                break
++        # Batch: a random subset in random order (others skip this step).
++        live = list(self.reqs.values())
++        rng.shuffle(live)
++        batch = [r for r in live if rng.random() < 0.85] or live[:1]
++        batch = batch[:N_PAD]
++        N = len(batch)
++        qlens = [rng.randint(1, NUM_SPEC + 1) for _ in batch]
++        # Mixed batch: non-spec rows interleaved (row_indices).
++        if self.mixed:
++            B = N + rng.randint(1, 3)
++            rows = sorted(rng.sample(range(B), N))
++        else:
++            B, rows = N, list(range(N))
++        num_acc = torch.ones(B, dtype=torch.int32)
++        for n, r in enumerate(batch):
++            # Includes 0 (clamped to 1) and > qlen (clamped).
++            num_acc[rows[n]] = rng.randint(0, qlens[n] + 1)
++        block_table = torch.zeros((B, MAX_BLOCKS), dtype=torch.int32)
++        num_comp = torch.zeros(B, dtype=torch.int32)
++        for n, r in enumerate(batch):
++            self._ensure_blocks(r, r.computed + qlens[n])
++            block_table[rows[n], : len(r.blocks)] = torch.tensor(r.blocks)
++            num_comp[rows[n]] = r.computed
++        cu = torch.zeros(N + 1, dtype=torch.int32)
++        cu[1:] = torch.cumsum(torch.tensor(qlens), 0)
++        T = int(cu[-1])
++        slots = torch.tensor([r.run_slot for r in batch], dtype=torch.int32)
++        reqs = torch.tensor([r.row for r in batch], dtype=torch.int32)
++        cu_d, slots_d, reqs_d = cu.to(DEV), slots.to(DEV), reqs.to(DEV)
++        num_acc_d, bt_d, nc_d = num_acc.to(DEV), block_table.to(DEV), num_comp.to(DEV)
++        row_idx = torch.tensor(rows, dtype=torch.int32, device=DEV) if self.mixed else None
++        conv = 2 * H * K + HV * V
++        qkv = [(torch.randn((T, conv), generator=self.gen, device=DEV) * 0.5).to(torch.bfloat16) for _ in range(L)]
++        ba = [torch.randn((T, 2 * HV), generator=self.gen, device=DEV).to(torch.bfloat16) for _ in range(L)]
++
++        def args(i):
++            x = qkv[i]
++            return (
++                x[:, : H * K].view(T, H, K),
++                x[:, H * K : 2 * H * K].view(T, H, K),
++                x[:, 2 * H * K :].view(T, HV, V),
++                ba[i][:, HV:],
++                ba[i][:, :HV],
++                self.A_log[i],
++                self.dt_bias[i],
++            )
++
++        # Reference: verify (eager) then commit.
++        ref_out = []
++        for i in range(L):
++            ref_out.append(
++                gdn_recover_verify(
++                    *args(i), self.ref_states[i], self.ref_rec[i],
++                    cu_seqlens=cu_d, slot_indices=slots_d,
++                )
++            )
++        # Fold: verify (eager or graph replay).
++        if self.graph:
++            for i in range(L):
++                self.g_qkv[i][:T].copy_(qkv[i])
++                self.g_ba[i][:T].copy_(ba[i])
++            self.g_cu.fill_(T)
++            self.g_cu[: N + 1].copy_(cu_d)
++            self.g_slot.zero_()
++            self.g_slot[:N].copy_(slots_d)
++            self.g_req.zero_()
++            self.g_req[:N].copy_(reqs_d)
++            self.graph_obj.replay()
++            fold_out = [self.g_out[i][:T] for i in range(L)]
++        else:
++            # Padded rows (slot 0, request row 0) as the builder stages them.
++            pad = rng.randint(0, 2)
++            cu_p = torch.cat([cu_d, cu_d[-1:].repeat(pad)])
++            sl_p = torch.cat([slots_d, torch.zeros(pad, dtype=torch.int32, device=DEV)])
++            rq_p = torch.cat([reqs_d, torch.zeros(pad, dtype=torch.int32, device=DEV)])
++            fold_out = [
++                gdn_recover_verify(
++                    *args(i), self.fold_states[i], self.fold_rec[i],
++                    cu_seqlens=cu_p, slot_indices=sl_p,
++                    req_indices=rq_p, defer=self.defer,
++                )
++                for i in range(L)
++            ]
++        for i in range(L):
++            _eq(fold_out[i], ref_out[i], f"layer {i} verify output")
++        # The fold verify stored the previous step's committed state in place.
++        if self.prev_ref is not None:
++            for i in range(L):
++                for r in batch:
++                    _eq(
++                        self.fold_states[i][r.run_slot],
++                        self.prev_ref[i][r.run_slot],
++                        f"layer {i} slot {r.run_slot} state after fold",
++                    )
++        align = dict(
++            block_table=bt_d if self.align else None,
++            num_computed_tokens=nc_d if self.align else None,
++            mamba_block_size=BS if self.align else 0,
++        )
++        self.ref_group.commit(slots_d, cu_d, num_acc_d, row_indices=row_idx, **align)
++        self.fold_group.commit_deferred(
++            slots_d, cu_d, num_acc_d, reqs_d, row_indices=row_idx, **align
++        )
++        torch.cuda.synchronize()
++        # Boundary blocks are written at commit time in both paths.
++        if self.align:
++            for i in range(L):
++                for r in self.reqs.values():
++                    for b in r.blocks:
++                        if b != r.run_slot:
++                            _eq(self.fold_states[i][b], self.ref_states[i][b],
++                                f"layer {i} boundary block {b}")
++        self.prev_ref = [s.clone() for s in self.ref_states]
++        # Advance computed tokens by the accepted count (clamped as the plan).
++        for n, r in enumerate(batch):
++            r.computed += max(1, min(int(num_acc[rows[n]]), qlens[n]))
++        return N
++
++
++@pytest.mark.parametrize("fmt", ["int16_row", "fp32"])
++@pytest.mark.parametrize("graph", [False, True])
++@pytest.mark.parametrize("align", [False, True])
++@pytest.mark.parametrize("mixed", [False, True])
++def test_recover_fold_matches_eager_commit(fmt, graph, align, mixed):
++    seed = zlib.crc32(f"{fmt}{graph}{align}{mixed}".encode())
++    sim = _Sim(fmt, graph, align, mixed, seed=seed)
++    rows = 0
++    for _ in range(60):
++        rows += sim.step()
++    assert rows > 150
++
++
++def test_recover_fold_detects_missing_admission_reset():
++    """Negative control: without the admission reset a reused request row
++    folds its predecessor's records, and the comparison must catch it."""
++    sim = _Sim("int16_row", False, False, False, seed=7, reset=False)
++    with pytest.raises(AssertionError):
++        for _ in range(200):
++            sim.step()
+diff --git a/vllm/envs.py b/vllm/envs.py
+index e8bac8545..217075c3a 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -137,6 +137,7 @@ if TYPE_CHECKING:
+     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+     VLLM_GDN_SPEC_STATE: Literal["per_token", "recover"] = "per_token"
+     VLLM_GDN_SPEC_STATE_W: int = 1
++    VLLM_GDN_RECOVER_FOLD: bool = False
+     VLLM_DISABLE_PYNCCL: bool = False
+     VLLM_USE_OINK_OPS: bool = False
+     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
+@@ -1325,6 +1326,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # ring and are folded into the state once W tokens are pending (the verify
+     # replays them in registers); 1 folds every step.
+     "VLLM_GDN_SPEC_STATE_W": lambda: int(os.getenv("VLLM_GDN_SPEC_STATE_W", "1")),
++    # VLLM_GDN_SPEC_STATE=recover with W = 1: defer each step's commit into the
++    # next step's verify (fold the accepted records, store the state in place,
++    # then verify). One state read + one write per step instead of two reads
++    # + one write; records live in a per-request side buffer. Bit-identical.
++    "VLLM_GDN_RECOVER_FOLD": lambda: (
++        os.getenv("VLLM_GDN_RECOVER_FOLD", "0").lower() in ("1", "true")
++    ),
+     # Disable pynccl (using torch.distributed instead)
+     "VLLM_DISABLE_PYNCCL": lambda: (
+         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 0111c0624..3b48dc1b4 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -48,6 +48,7 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weigh
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateShapeCalculator,
+     gdn_spec_recover_enabled,
++    gdn_spec_recover_fold,
+     gdn_spec_recover_window,
+     is_conv_state_dim_first,
+ )
+@@ -911,6 +912,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # W = 1: one record row per spec request of a step, outside the KV
+         # cache (allocated with the model, so the memory profile counts it).
+         self._recover_records: GDNRecoverRecords | None = None
++        # VLLM_GDN_RECOVER_FOLD=1: the next verify folds the accepted records
++        # (deferred commit); records are kept per request-table row.
++        self.recover_fold = self.spec_recover and gdn_spec_recover_fold(self.num_spec)
+         if self.spec_recover and self.recover_window == 1:
+             self._recover_records = GDNRecoverRecords.allocate(
+                 vllm_config.scheduler_config.max_num_seqs,
+@@ -921,8 +925,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 self.num_spec,
+                 vllm_config.model_config.dtype,
+                 current_platform.current_device(),
+-                by_row=True,
++                by_row=not self.recover_fold,
++                by_req=self.recover_fold,
+             )
++            if self.recover_fold:
++                logger.info_once(
++                    "GDN recover fold (QW38): deferred commit, records %.1f MiB "
++                    "per GDN layer (%d request rows, ring %d)",
++                    self._recover_records.nbytes() / 2**20,
++                    vllm_config.scheduler_config.max_num_seqs,
++                    self._recover_records.ring_len,
++                )
+         if self.spec_recover:
+             reason = self._spec_recover_unsupported_reason(vllm_config)
+             if reason is not None:
+@@ -2312,6 +2325,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             scale=self.head_k_dim**-0.5,
+             window=window,
+             trackers=trackers,
++            req_indices=getattr(attn_metadata, "recover_req_indices", None)
++            if getattr(self, "recover_fold", False)
++            else None,
++            defer=getattr(attn_metadata, "recover_defer", None)
++            if getattr(self, "recover_fold", False)
++            else None,
+         )
+         return out
+ 
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 504e91a42..ad7cb83aa 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -72,6 +72,16 @@ def gdn_spec_recover_ring_in_page(num_spec: int) -> bool:
+     return gdn_spec_recover_enabled(num_spec) and gdn_spec_recover_window() > 1
+ 
+ 
++def gdn_spec_recover_fold(num_spec: int) -> bool:
++    """Deferred commit of VLLM_GDN_SPEC_STATE=recover (VLLM_GDN_RECOVER_FOLD=1):
++    the next verify folds the accepted records (W = 1 only)."""
++    return (
++        gdn_spec_recover_enabled(num_spec)
++        and envs.VLLM_GDN_RECOVER_FOLD
++        and gdn_spec_recover_window() == 1
++    )
++
++
+ def gdn_spec_recover_window() -> int:
+     """Commit window W of VLLM_GDN_SPEC_STATE=recover (VLLM_GDN_SPEC_STATE_W)."""
+     window = envs.VLLM_GDN_SPEC_STATE_W
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index 1daf9f1c2..9ba787927 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -38,7 +38,7 @@ from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
+     gdn_int16_state_rows,
+     gdn_int16_store_state,
+ )
+-from vllm.triton_utils import tl, triton
++from vllm.triton_utils import tl, tldevice, triton
+ 
+ # State formats (constexpr FMT values).
+ GDN_STATE_FMT_FP32 = 0
+@@ -155,6 +155,41 @@ def gdn_spec_store_state(
+         tl.store(p, b_h.to(p.dtype.element_ty), mask=mask_h)
+ 
+ 
++@triton.jit
++def gdn_spec_store_requant_state(
++    p_head,
++    b_h,
++    o_v,
++    o_k,
++    mask_v,
++    mask_h,
++    V: tl.constexpr,
++    K: tl.constexpr,
++    FMT: tl.constexpr,
++):
++    """Store like `gdn_spec_store_state` and return exactly what
++    `gdn_spec_load_state` would read back (no reload from memory)."""
++    if FMT == _FMT_INT16_ROW:
++        # Same ops as gdn_int16_store_state; the dequantized codes equal the
++        # int16 load path's `code.to(fp32) * scale` bit for bit.
++        b_amax = tl.max(tl.where(mask_h, tl.abs(b_h), 0.0), axis=1)
++        b_scale = b_amax * (1.0 / 32767.0)
++        b_inv = tl.where(b_amax > 0, 32767.0 / b_amax, 0.0)
++        b_q = tldevice.float2int_rn(b_h * b_inv[:, None])
++        tl.store(
++            p_head + o_v[:, None] * K + o_k[None, :], b_q.to(tl.int16), mask=mask_h
++        )
++        p_scale = (p_head + V * K).to(tl.pointer_type(tl.float32), bitcast=True)
++        tl.store(p_scale + o_v, b_scale, mask=mask_v)
++        b_out = tl.where(mask_h, b_q.to(tl.float32) * b_scale[:, None], 0.0)
++    else:
++        tl.static_assert(FMT == _FMT_FP32, "GDN spec state format not implemented")
++        p = p_head + o_v[:, None] * K + o_k[None, :]
++        tl.store(p, b_h.to(p.dtype.element_ty), mask=mask_h)
++        b_out = tl.where(mask_h, b_h.to(p.dtype.element_ty).to(tl.float32), 0.0)
++    return b_out
++
++
+ # --------------------------------------------------------------------------
+ # Record replay (commit, and W > 1 verify)
+ # --------------------------------------------------------------------------
+@@ -209,6 +244,9 @@ def _gdn_recover_verify_kernel(
+     ring_pending,
+     cu_seqlens,
+     slot_indices,
++    req_indices,
++    defer_half,
++    defer_pending,
+     beta,
+     threshold,
+     scale,
+@@ -224,6 +262,7 @@ def _gdn_recover_verify_kernel(
+     stride_rk_slot,
+     stride_g_slot,
+     stride_slot_idx,
++    stride_req_idx,
+     H: tl.constexpr,
+     HV: tl.constexpr,
+     K: tl.constexpr,
+@@ -236,6 +275,8 @@ def _gdn_recover_verify_kernel(
+     FMT: tl.constexpr,
+     RECORDS_BY_ROW: tl.constexpr,
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++    DEFER: tl.constexpr = False,
++    HALF: tl.constexpr = 1,
+ ):
+     i_v, i_nh = tl.program_id(0), tl.program_id(1)
+     i_n, i_hv = i_nh // HV, i_nh % HV
+@@ -278,11 +319,37 @@ def _gdn_recover_verify_kernel(
+     rec = slot
+     if RECORDS_BY_ROW:
+         rec = i_n.to(tl.int64)
++    if DEFER:
++        # Records live in the request's side-buffer row (req_state index).
++        rec = tl.load(req_indices + i_n * stride_req_idx).to(tl.int64)
+     p_u = rec_u + rec * stride_u_slot + i_hv * R * V + o_v
+     p_rk = rec_k + rec * stride_rk_slot + i_h * R * K + o_k
+     p_g = rec_g + rec * stride_g_slot + i_hv * R
+     pos0 = 0
+-    if W > 1:
++    if DEFER:
++        # Deferred commit: fold the previous step's accepted records (ring
++        # half `rd`) exactly as the post-sampling commit would, store the
++        # committed state in place, and continue from what a reload of that
++        # store would give. This step's records go to the other half, so
++        # programs still replaying the shared k/g rows never race them.
++        rd = tl.load(defer_half + rec)
++        pending = tl.load(defer_pending + rec)
++        if pending > 0:
++            for j in range(0, pending):
++                b_h = _gdn_replay_record(
++                    b_h,
++                    p_u + (rd * HALF + j) * V,
++                    p_rk + (rd * HALF + j) * K,
++                    p_g + rd * HALF + j,
++                    mask_k,
++                    mask_v,
++                    USE_QK_L2NORM_IN_KERNEL,
++                )
++            b_h = tl.zeros([BV, BK], dtype=tl.float32) + gdn_spec_store_requant_state(
++                p_state, b_h, o_v, o_k, mask_v, mask_h, V, K, FMT
++            )
++        pos0 = (1 - rd) * HALF
++    elif W > 1:
+         start = tl.load(ring_start + slot)
+         pending = tl.load(ring_pending + slot)
+         for j in range(0, pending):
+@@ -352,12 +419,21 @@ class GDNRecoverRecords:
+     by_row=False: n = Mamba slots (rings in the Mamba page, W >= 1).
+     by_row=True: n = spec rows of a step (a per-layer buffer outside the KV
+     cache; W = 1 only, since every step folds its records).
++    by_req=True: n = request-table rows (deferred commit, see
++    GDNRecoverDeferTrackers): R = 2 * (num_spec + 1), two halves used
++    alternately by consecutive steps.
+     """
+ 
+     u: torch.Tensor
+     k: torch.Tensor
+     g: torch.Tensor
+     by_row: bool = False
++    by_req: bool = False
++
++    @property
++    def half(self) -> int:
++        assert self.by_req
++        return self.u.shape[2] // 2
+ 
+     @property
+     def ring_len(self) -> int:
+@@ -376,24 +452,31 @@ class GDNRecoverRecords:
+         device: torch.device | str,
+         window: int = 1,
+         by_row: bool = False,
++        by_req: bool = False,
+     ) -> "GDNRecoverRecords":
+-        """`num_slots` slots (or, with by_row, spec rows: R = num_spec + 1)."""
++        """`num_slots` slots (or, with by_row, spec rows: R = num_spec + 1;
++        with by_req, request-table rows: R = 2 * (num_spec + 1))."""
+         assert not (by_row and window != 1), "row records need window 1"
++        assert not (by_req and (by_row or window != 1)), "req records need W 1"
+         u_shape, k_shape, g_shape = gdn_recover_ring_shapes(
+             num_k_heads,
+             num_v_heads,
+             head_k_dim,
+             head_v_dim,
+             num_spec,
+-            0 if by_row else window,
++            num_spec + 1 if by_req else (0 if by_row else window),
+         )
+         return cls(
+             torch.zeros((num_slots, *u_shape), dtype=torch.float32, device=device),
+             torch.zeros((num_slots, *k_shape), dtype=dtype, device=device),
+             torch.zeros((num_slots, *g_shape), dtype=torch.float32, device=device),
+             by_row=by_row,
++            by_req=by_req,
+         )
+ 
++    def nbytes(self) -> int:
++        return sum(x.numel() * x.element_size() for x in (self.u, self.k, self.g))
++
+ 
+ @dataclass
+ class GDNRecoverTrackers:
+@@ -406,6 +489,53 @@ class GDNRecoverTrackers:
+     num_pending: torch.Tensor  # [num_slots] int32
+ 
+ 
++# Every live deferred-commit tracker pair, so that request admission can reset
++# a request-table row in all cache groups (gdn_recover_defer_reset_requests).
++_DEFER_TRACKERS: list["GDNRecoverDeferTrackers"] = []
++
++
++@dataclass
++class GDNRecoverDeferTrackers:
++    """Deferred commit (VLLM_GDN_RECOVER_FOLD=1), per cache group, indexed by
++    the runner's request-table row.
++
++    half[r]: ring half the last verify of request r wrote its records to.
++    pending[r]: accepted records of that half not folded into the state yet
++    (the next verify folds them first; 0 after a forced fold or a reset).
++
++    The post-sampling plan only updates these (and force-folds rows whose
++    accepted tokens cross a prefix-cache block boundary). A request-table row
++    is reset when a request is admitted to it, so a new or resumed request
++    never folds its predecessor's records."""
++
++    half: torch.Tensor  # [max_num_reqs] int32
++    pending: torch.Tensor  # [max_num_reqs] int32
++
++    @classmethod
++    def allocate(
++        cls, max_num_reqs: int, device: torch.device | str
++    ) -> "GDNRecoverDeferTrackers":
++        t = cls(
++            torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
++            torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
++        )
++        _DEFER_TRACKERS.append(t)
++        return t
++
++    def reset(self, req_indices: torch.Tensor | int) -> None:
++        if isinstance(req_indices, int):
++            self.pending[req_indices] = 0
++        elif req_indices.numel() > 0:
++            self.pending.index_fill_(0, req_indices.long(), 0)
++
++
++def gdn_recover_defer_reset_requests(req_indices: torch.Tensor | int) -> None:
++    """A request was admitted to these request-table rows: drop any pending
++    records left there (by a finished, aborted or preempted request)."""
++    for t in _DEFER_TRACKERS:
++        t.reset(req_indices)
++
++
+ def _slot_contiguous(x: torch.Tensor) -> bool:
+     """Each slot x[i] is contiguous (slots may be strided, e.g. page views)."""
+     expected = 1
+@@ -441,9 +571,16 @@ def gdn_recover_verify(
+     softplus_beta: float = 1.0,
+     softplus_threshold: float = 20.0,
+     use_qk_l2norm_in_kernel: bool = True,
++    req_indices: torch.Tensor | None = None,
++    defer: GDNRecoverDeferTrackers | None = None,
+ ) -> torch.Tensor:
+     """Verify spec tokens off each request's checkpoint without storing states.
+ 
++    Deferred commit (`defer` + by_req records + req_indices [N], the
++    request-table row of each spec request): first fold the request's pending
++    records of the previous step into its state (stored in place), then
++    verify; outputs and states equal the eager-commit path's bit for bit.
++
+     q, k: [T, H, K]; v: [T, HV, V]; a, b: [T, HV] (token-strided views are
+     fine, e.g. straight out of the packed conv output); state: [slots, HV, VP, K];
+     cu_seqlens: [N + 1]; slot_indices: [N] (or a strided column). Returns
+@@ -476,6 +613,13 @@ def gdn_recover_verify(
+         raise ValueError("GDN recover verify: window > 1 needs ring trackers")
+     if records.by_row and (window != 1 or cu_seqlens.shape[0] - 1 > records.u.shape[0]):
+         raise ValueError("GDN recover verify: row records need W = 1 and a row each")
++    if (defer is not None) != records.by_req or (
++        defer is not None and (req_indices is None or window != 1)
++    ):
++        raise ValueError(
++            "GDN recover verify: deferred commit needs by_req records, "
++            "request indices and W = 1"
++        )
+     if out is None:
+         out = torch.empty((T, HV, V), dtype=q.dtype, device=q.device)
+     elif out.dim() == 4:
+@@ -492,6 +636,11 @@ def gdn_recover_verify(
+     NV = triton.cdiv(V, BV)
+     ring_start = trackers.ring_start if trackers is not None else slot_indices
+     ring_pending = trackers.num_pending if trackers is not None else slot_indices
++    if defer is not None:
++        assert req_indices is not None
++        defer_half, defer_pending = defer.half, defer.pending
++    else:
++        req_indices = defer_half = defer_pending = slot_indices
+     grid = (NV, N * HV)
+     _gdn_recover_verify_kernel[grid](
+         A_log,
+@@ -510,6 +659,9 @@ def gdn_recover_verify(
+         ring_pending,
+         cu_seqlens,
+         slot_indices,
++        req_indices,
++        defer_half,
++        defer_pending,
+         softplus_beta,
+         softplus_threshold,
+         scale,
+@@ -525,6 +677,7 @@ def gdn_recover_verify(
+         records.k.stride(0),
+         records.g.stride(0),
+         slot_indices.stride(0),
++        req_indices.stride(0),
+         H=H,
+         HV=HV,
+         K=K,
+@@ -537,6 +690,8 @@ def gdn_recover_verify(
+         FMT=GDN_STATE_FORMATS[fmt],
+         RECORDS_BY_ROW=records.by_row,
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
++        DEFER=defer is not None,
++        HALF=R // 2 if defer is not None else 1,
+         num_warps=_NUM_WARPS,
+         num_stages=_NUM_STAGES,
+     )
+@@ -656,6 +811,84 @@ def _gdn_recover_plan_kernel(
+         tl.store(ring_pending + slot, tl.where(do_fold, 0, total), mask=valid)
+ 
+ 
++@triton.heuristics(
++    {
++        "HAS_ROW_INDICES": lambda args: args["row_indices"] is not None,
++        "ALIGN": lambda args: args["block_table"] is not None,
++    }
++)
++@triton.jit
++def _gdn_recover_defer_plan_kernel(
++    slot_indices,
++    cu_seqlens,
++    num_accepted,
++    row_indices,
++    req_indices,
++    defer_half,
++    defer_pending,
++    plan,
++    block_table,
++    num_computed,
++    stride_slot_idx,
++    stride_req_idx,
++    stride_block_table,
++    mamba_block_size,
++    HALF: tl.constexpr,
++    HAS_ROW_INDICES: tl.constexpr,
++    ALIGN: tl.constexpr,
++):
++    """Deferred commit, after sampling: record what this step's verify left
++    (ring half, accepted count) for the next verify to fold. Rows whose
++    accepted tokens reach a prefix-cache block boundary are folded now
++    instead (plan count > 0), exactly like the eager commit, so the boundary
++    block and the running state are complete before the scheduler can cache
++    or migrate them.
++
++    plan[n] = (src, dst, start, count, boundary_slot, boundary_count, rec, 0)."""
++    i_n = tl.program_id(0)
++    p_plan = plan + i_n * 8
++    slot = tl.load(slot_indices + i_n * stride_slot_idx).to(tl.int32)
++    qlen = (tl.load(cu_seqlens + i_n + 1) - tl.load(cu_seqlens + i_n)).to(tl.int32)
++    row = i_n
++    if HAS_ROW_INDICES:
++        row = tl.load(row_indices + i_n)
++    # The verify skipped rows without a slot or tokens: leave their trackers.
++    valid = (slot > 0) & (qlen > 0)
++    n_acc = tl.minimum(tl.maximum(tl.load(num_accepted + row).to(tl.int32), 1), qlen)
++    n_acc = tl.where(valid, n_acc, 0)
++    req = tl.load(req_indices + i_n * stride_req_idx).to(tl.int64)
++    wr = 1 - tl.load(defer_half + req, mask=valid, other=0)
++    forced = valid & (n_acc < 0)  # False; refined by ALIGN
++    b_slot = 0
++    b_count = 0
++    if ALIGN:
++        computed = tl.load(num_computed + row).to(tl.int32)
++        next_boundary = (computed // mamba_block_size + 1) * mamba_block_size
++        b_len = next_boundary - computed
++        crosses = valid & (n_acc > 0) & (b_len <= n_acc)
++        b_col = next_boundary // mamba_block_size - 1
++        b_slot = tl.load(
++            block_table + row.to(tl.int64) * stride_block_table + b_col,
++            mask=crosses,
++            other=0,
++        ).to(tl.int32)
++        b_count = b_len
++        # As the eager commit: the final store covers a boundary block that
++        # is the running block itself.
++        b_slot = tl.where(crosses & (b_slot > 0) & (b_slot != slot), b_slot, 0)
++        forced = crosses
++    tl.store(p_plan + 0, slot)
++    tl.store(p_plan + 1, slot)
++    tl.store(p_plan + 2, wr * HALF)
++    tl.store(p_plan + 3, tl.where(forced, n_acc, 0))
++    tl.store(p_plan + 4, b_slot)
++    tl.store(p_plan + 5, b_count)
++    tl.store(p_plan + 6, req.to(tl.int32))
++    tl.store(p_plan + 7, 0)
++    tl.store(defer_half + req, wr, mask=valid)
++    tl.store(defer_pending + req, tl.where(forced, 0, n_acc), mask=valid)
++
++
+ @triton.jit
+ def _gdn_recover_commit_kernel(
+     state_addrs,
+@@ -682,12 +915,14 @@ def _gdn_recover_commit_kernel(
+     FMT: tl.constexpr,
+     RECORDS_BY_ROW: tl.constexpr,
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++    REC_FROM_PLAN: tl.constexpr = False,
+ ):
+     """Fold planned records into the checkpoint, all layers of a group at once."""
+     i_v, i_n, i_lh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+     i_l, i_hv = i_lh // HV, i_lh % HV
+     i_h = i_hv // (HV // H)
+-    p_plan = plan + i_n * 6
++    PLAN_W: tl.constexpr = 8 if REC_FROM_PLAN else 6
++    p_plan = plan + i_n * PLAN_W
+     count = tl.load(p_plan + 3)
+     if count == 0:
+         return
+@@ -734,6 +969,8 @@ def _gdn_recover_commit_kernel(
+     rec = src
+     if RECORDS_BY_ROW:
+         rec = i_n.to(tl.int64)
++    if REC_FROM_PLAN:
++        rec = tl.load(p_plan + 6).to(tl.int64)
+     p_u = rec_u + rec * stride_u_slot + i_hv * R * V + o_v
+     p_rk = rec_k + rec * stride_rk_slot + i_h * R * K + o_k
+     p_g = rec_g + rec * stride_g_slot + i_hv * R
+@@ -786,9 +1023,15 @@ class GDNRecoverCommitGroup:
+         window: int = 1,
+         trackers: GDNRecoverTrackers | None = None,
+         use_qk_l2norm_in_kernel: bool = True,
++        defer: GDNRecoverDeferTrackers | None = None,
+     ) -> None:
+         if not states or len(states) != len(records):
+             raise ValueError("GDN recover commit: need one record set per state")
++        if any(r.by_req != (defer is not None) for r in records):
++            raise ValueError("GDN recover commit: deferred commit needs by_req records")
++        if defer is not None and window != 1:
++            raise ValueError("GDN recover commit: deferred commit needs W = 1")
++        self.defer = defer
+         s0, r0 = states[0], records[0]
+         for s, r in zip(states, records):
+             if (
+@@ -835,12 +1078,94 @@ class GDNRecoverCommitGroup:
+         self._plan: torch.Tensor | None = None
+ 
+     def _plan_buffer(self, n: int) -> torch.Tensor:
++        width = 8 if self.defer is not None else 6
+         if self._plan is None or self._plan.shape[0] < n:
+             self._plan = torch.empty(
+-                (max(n, 64), 6), dtype=torch.int32, device=self.states[0].device
++                (max(n, 64), width), dtype=torch.int32, device=self.states[0].device
+             )
+         return self._plan[:n]
+ 
++    def _launch_commit(self, plan: torch.Tensor, n: int) -> None:
++        s0, r0 = self.states[0], self.records[0]
++        BK = triton.next_power_of_2(self.K)
++        BV = min(triton.next_power_of_2(self.V), 32)
++        grid = (triton.cdiv(self.V, BV), n, len(self.states) * self.HV)
++        _gdn_recover_commit_kernel[grid](
++            self.state_addrs,
++            self.u_addrs,
++            self.k_addrs,
++            self.g_addrs,
++            s0,
++            r0.u,
++            r0.k,
++            r0.g,
++            plan,
++            s0.stride(0),
++            r0.u.stride(0),
++            r0.k.stride(0),
++            r0.g.stride(0),
++            H=self.H,
++            HV=self.HV,
++            K=self.K,
++            V=self.V,
++            VP=self.VP,
++            BK=BK,
++            BV=BV,
++            R=r0.ring_len,
++            FMT=GDN_STATE_FORMATS[self.fmt],
++            RECORDS_BY_ROW=r0.by_row,
++            USE_QK_L2NORM_IN_KERNEL=self.use_qk_l2norm_in_kernel,
++            REC_FROM_PLAN=self.defer is not None,
++            num_warps=_NUM_WARPS,
++            num_stages=_NUM_STAGES,
++        )
++
++    def commit_deferred(
++        self,
++        slot_indices: torch.Tensor,
++        cu_seqlens: torch.Tensor,
++        num_accepted: torch.Tensor,
++        req_indices: torch.Tensor,
++        row_indices: torch.Tensor | None = None,
++        block_table: torch.Tensor | None = None,
++        num_computed_tokens: torch.Tensor | None = None,
++        mamba_block_size: int = 0,
++    ) -> None:
++        """Deferred commit after sampling (VLLM_GDN_RECOVER_FOLD=1).
++
++        Records each request's accepted count for the next verify to fold;
++        folds now (eagerly, as `commit`) only the rows whose accepted tokens
++        reach a prefix-cache block boundary (align mode). Arguments as
++        `commit`; req_indices[n]: request-table row of spec request n."""
++        assert self.defer is not None
++        if block_table is not None:
++            assert num_computed_tokens is not None and mamba_block_size > 0
++        N = cu_seqlens.shape[0] - 1
++        if N <= 0:
++            return
++        plan = self._plan_buffer(N)
++        _gdn_recover_defer_plan_kernel[(N,)](
++            slot_indices,
++            cu_seqlens,
++            num_accepted,
++            row_indices,
++            req_indices,
++            self.defer.half,
++            self.defer.pending,
++            plan,
++            block_table,
++            num_computed_tokens,
++            slot_indices.stride(0),
++            req_indices.stride(0),
++            block_table.stride(0) if block_table is not None else 0,
++            mamba_block_size,
++            HALF=self.records[0].half,
++            num_warps=1,
++        )
++        if block_table is not None:
++            # Only crossing rows have a nonzero count; the others exit early.
++            self._launch_commit(plan, N)
++
+     def commit(
+         self,
+         slot_indices: torch.Tensor,
+@@ -870,6 +1195,7 @@ class GDNRecoverCommitGroup:
+         indexed like num_accepted (align mode: store the state at a crossed
+         block boundary into that boundary's block).
+         """
++        assert self.defer is None, "deferred commit: use commit_deferred"
+         if block_table is not None:
+             assert boundary_slots is None and num_computed_tokens is not None
+             assert mamba_block_size > 0
+@@ -899,38 +1225,7 @@ class GDNRecoverCommitGroup:
+             W=self.window,
+             num_warps=1,
+         )
+-        s0, r0 = self.states[0], self.records[0]
+-        BK = triton.next_power_of_2(self.K)
+-        BV = min(triton.next_power_of_2(self.V), 32)
+-        grid = (triton.cdiv(self.V, BV), N, len(self.states) * self.HV)
+-        _gdn_recover_commit_kernel[grid](
+-            self.state_addrs,
+-            self.u_addrs,
+-            self.k_addrs,
+-            self.g_addrs,
+-            s0,
+-            r0.u,
+-            r0.k,
+-            r0.g,
+-            plan,
+-            s0.stride(0),
+-            r0.u.stride(0),
+-            r0.k.stride(0),
+-            r0.g.stride(0),
+-            H=self.H,
+-            HV=self.HV,
+-            K=self.K,
+-            V=self.V,
+-            VP=self.VP,
+-            BK=BK,
+-            BV=BV,
+-            R=r0.ring_len,
+-            FMT=GDN_STATE_FORMATS[self.fmt],
+-            RECORDS_BY_ROW=r0.by_row,
+-            USE_QK_L2NORM_IN_KERNEL=self.use_qk_l2norm_in_kernel,
+-            num_warps=_NUM_WARPS,
+-            num_stages=_NUM_STAGES,
+-        )
++        self._launch_commit(plan, N)
+ 
+     def flush(self, slots: torch.Tensor) -> None:
+         """Force-fold every pending record of `slots` and reset their trackers
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index c41949c2d..9f5d345ee 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -4,8 +4,9 @@
+ 
+ import math
+ from dataclasses import dataclass, replace
+-from typing import Literal
++from typing import Any, Literal
+ 
++import numpy as np
+ import torch
+ 
+ from vllm._aiter_ops import rocm_aiter_ops
+@@ -157,6 +158,10 @@ class GDNRecoverSpecMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+     recover_block_table: torch.Tensor | None = None
+     recover_num_computed: torch.Tensor | None = None
+     recover_block_size: int = 0
++    # VLLM_GDN_RECOVER_FOLD=1 (deferred commit): spec row -> request-table
++    # row, and this cache group's GDNRecoverDeferTrackers.
++    recover_req_indices: torch.Tensor | None = None
++    recover_defer: Any = None
+ 
+     def commit_recoverssm_state(
+         self, num_accepted_tokens: torch.Tensor
+@@ -168,6 +173,19 @@ class GDNRecoverSpecMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+         ):
+             return None
+         assert self.spec_query_start_loc is not None
++        if self.recover_defer is not None:
++            assert self.recover_req_indices is not None
++            self.recover_builder.recover_commit_group().commit_deferred(
++                self.recover_slot_indices,
++                self.spec_query_start_loc[: self.num_spec_decodes + 1],
++                num_accepted_tokens,
++                self.recover_req_indices[: self.num_spec_decodes],
++                row_indices=self.recover_row_indices,
++                block_table=self.recover_block_table,
++                num_computed_tokens=self.recover_num_computed,
++                mamba_block_size=self.recover_block_size,
++            )
++            return None
+         self.recover_builder.recover_commit_group().commit(
+             self.recover_slot_indices,
+             self.spec_query_start_loc[: self.num_spec_decodes + 1],
+@@ -256,6 +274,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         self._recover_window = gdn_spec_recover_window() if self.spec_recover else 1
+         self._recover_group = None
+         self._recover_group_key: tuple[int, ...] | None = None
++        # VLLM_GDN_RECOVER_FOLD=1: per-group deferred-commit trackers and the
++        # spec rows' request-table rows (a persistent buffer: FULL graphs
++        # replay the verify with it).
++        from vllm.model_executor.layers.mamba.mamba_utils import gdn_spec_recover_fold
++        from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++            GDNRecoverDeferTrackers,
++        )
++
++        self._recover_fold = self.spec_recover and gdn_spec_recover_fold(self.num_spec)
++        self._recover_defer = None
++        self._recover_req_idx_buf: torch.Tensor | None = None
++        if self._recover_fold:
++            max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
++            self._recover_defer = GDNRecoverDeferTrackers.allocate(
++                max_num_reqs, device
++            )
++            self._recover_req_idx_buf = torch.zeros(
++                max_num_reqs, dtype=torch.int32, device=device
++            )
+ 
+         self.use_full_cuda_graph: bool = (
+             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+@@ -766,6 +803,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                         device=query_start_loc.device,
+                         dtype=torch.int32,
+                     )
++                if self._recover_fold:
++                    recover_kwargs["recover_req_indices"] = self._recover_spec_req_idx(
++                        m, spec_sequence_masks_cpu, num_spec_decodes
++                    )
++                    recover_kwargs["recover_defer"] = self._recover_defer
+                 if self.vllm_config.cache_config.mamba_cache_mode == "align":
+                     recover_kwargs["recover_block_table"] = m.block_table_tensor
+                     recover_kwargs["recover_num_computed"] = (
+@@ -774,6 +816,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                     recover_kwargs["recover_block_size"] = self.kv_cache_spec.block_size
+         if num_prefills > 0 or num_decodes > 0:
+             self._recover_flush(non_spec_state_indices_tensor)
++            if self._recover_fold:
++                # Non-spec rows are prefills (a decoding request stays a spec
++                # row): they never fold records, so drop any left in their
++                # request-table rows (also reset at admission).
++                self._recover_reset_rows(m, spec_sequence_masks_cpu)
+         attn_metadata = metadata_cls(
+             **recover_kwargs,
+             num_prefills=num_prefills,
+@@ -899,6 +946,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             )
+             if m.recover_block_table is not None:
+                 recover_kwargs["recover_block_table"] = full_blk_table
++            if self._recover_fold:
++                # Batch-level request rows are shared; trackers are per group.
++                recover_kwargs["recover_defer"] = self._recover_defer
+         return replace(
+             m,
+             spec_state_indices_tensor=spec_indices,
+@@ -955,10 +1005,57 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 num_k_heads=layers[0].num_k_heads // layers[0].tp_size,
+                 window=window,
+                 trackers=trackers,
++                defer=self._recover_defer,
+             )
+             self._recover_group_key = key
+         return self._recover_group
+ 
++    def _recover_spec_req_idx(
++        self,
++        m: CommonAttentionMetadata,
++        spec_sequence_masks_cpu: torch.Tensor | None,
++        num_spec_decodes: int,
++    ) -> torch.Tensor:
++        """Request-table rows of the spec rows, in the persistent buffer."""
++        buf = self._recover_req_idx_buf
++        assert buf is not None
++        if m.req_idx is None:
++            # Records keyed by a wrong row would fold another request's
++            # records: never guess.
++            raise RuntimeError(
++                "VLLM_GDN_RECOVER_FOLD=1 needs CommonAttentionMetadata.req_idx"
++            )
++        req_idx = np.asarray(m.req_idx)
++        if spec_sequence_masks_cpu is not None:
++            # Padding rows (past the real requests) are never spec rows.
++            req_idx = req_idx[spec_sequence_masks_cpu[: req_idx.shape[0]].numpy()]
++        assert req_idx.shape[0] == num_spec_decodes
++        if num_spec_decodes and int(req_idx.max()) >= buf.shape[0]:
++            raise RuntimeError("GDN recover fold: request index out of range")
++        async_tensor_h2d(req_idx.astype(np.int32), out=buf[:num_spec_decodes])
++        return buf
++
++    def _recover_reset_rows(
++        self,
++        m: CommonAttentionMetadata,
++        spec_sequence_masks_cpu: torch.Tensor | None,
++    ) -> None:
++        assert self._recover_defer is not None
++        if m.req_idx is None:
++            return
++        req_idx = np.asarray(m.req_idx)[: m.num_reqs]
++        if spec_sequence_masks_cpu is not None:
++            req_idx = req_idx[~spec_sequence_masks_cpu[: req_idx.shape[0]].numpy()]
++        if req_idx.shape[0] == 0:
++            return
++        self._recover_defer.reset(
++            async_tensor_h2d(
++                torch.from_numpy(req_idx.astype(np.int64)),
++                device=self._recover_defer.pending.device,
++                dtype=torch.int64,
++            )
++        )
++
+     def _recover_flush(self, slots: torch.Tensor | None) -> None:
+         """Fold the pending records of slots read outside the spec verify
+         (prefill / non-spec decode rows) and reset their ring trackers.
+@@ -997,6 +1094,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+ 
+         num_accepted_tokens = torch.diff(m.query_start_loc)
+         num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
++        if self._recover_fold and m.req_idx is None:
++            # No real requests during capture (all trackers are still 0).
++            m = m.replace(req_idx=np.zeros(m.num_reqs, dtype=np.int32))
+         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
+ 
+         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 6925c1fdd..9993595fb 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -12,8 +12,12 @@ from vllm.config.compilation import CUDAGraphMode
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFuncsByType,
+     gdn_spec_recover_enabled,
++    gdn_spec_recover_fold,
+     gdn_spec_recover_window,
+ )
++from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++    gdn_recover_defer_reset_requests,
++)
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+@@ -107,6 +111,9 @@ class MambaHybridModelState(DefaultModelState):
+             )
+         # KDA RecoverSSM, and GDN with VLLM_GDN_SPEC_STATE=recover: the verify
+         # leaves records that the commit after sampling folds into the state.
++        self._gdn_recover_fold = gdn_spec_recover_fold(
++            vllm_config.num_speculative_tokens
++        )
+         self.recoverssm = (
+             RecoverSSMState()
+             if self.cache_config.use_kda_recoverssm
+@@ -133,6 +140,9 @@ class MambaHybridModelState(DefaultModelState):
+         super().add_request(req_index, new_req_data)
+         # Must reset the speculative acceptance count in this idx which could be stale.
+         self.num_accepted_tokens_gpu[req_index].fill_(1)
++        if self._gdn_recover_fold:
++            # Drop deferred-commit records a previous request left in this row.
++            gdn_recover_defer_reset_requests(req_index)
+         if self._align_mode:
+             # Seed the running state block from the resumed/prefilled position.
+             # The column is in mamba blocks. cache_config.block_size is the
+@@ -371,6 +381,13 @@ class MambaHybridModelState(DefaultModelState):
+             model_specific_attn_metadata=mamba_attn_metadata,
+             for_cudagraph_capture=for_capture,
+             rswa_prefix_lens=input_batch.prompt_lens,
++            # GDN recover fold keys its records by request-table row; capture
++            # and dummy batches have no real requests.
++            req_idx=(
++                np.zeros(num_reqs, dtype=np.int32)
++                if for_capture
++                else input_batch.idx_mapping_np
++            ),
+         )
+         if self._use_flashinfer_replayssm:
+             self._replayssm_query_start_loc = None

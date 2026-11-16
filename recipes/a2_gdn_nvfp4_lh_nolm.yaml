@@ -1,0 +1,109 @@
+# QW38 ModelOpt PTQ recipe (a2gdn): A2 subset: published map + NVFP4 on GDN in_proj_qkv/in_proj_z/out_proj (48 layers); attention q/k/v/o stay FP8, algo=lh lm_head quantizer OFF here: its NVFP4 lm_head is grafted from the repro-pub export (graft_lmhead.py).
+# modelopt-schema: modelopt.recipe.config.ModelOptPTQRecipe
+{
+ "imports": {
+  "base_disable_all": "configs/ptq/units/base_disable_all",
+  "fp8": "configs/numerics/fp8",
+  "nvfp4": "configs/numerics/nvfp4",
+  "nvfp4_static": "configs/numerics/nvfp4_static"
+ },
+ "metadata": {
+  "description": "A2 subset: published map + NVFP4 on GDN in_proj_qkv/in_proj_z/out_proj (48 layers); attention q/k/v/o stay FP8, algo=lh"
+ },
+ "quantize": {
+  "algorithm": {
+   "method": "local_hessian",
+   "fp8_scale_sweep": true,
+   "shared_states": {
+    "weight_global_amax": {
+     "patterns": [
+      "(?:(.*)\\.)?(?:q_proj|k_proj|v_proj)",
+      "(?:(.*)\\.)?(?:gate_proj|up_proj)",
+      "(?:(.*)\\.)?(?:in_proj_qkv|in_proj_z)"
+     ]
+    }
+   },
+   "layerwise": {
+    "enable": true,
+    "get_qdq_activations_from_prev_layer": true
+   }
+  },
+  "quant_cfg": [
+   {
+    "$import": "base_disable_all"
+   },
+   {
+    "quantizer_name": "*language_model.layers.*.mlp.*.weight_quantizer",
+    "cfg": {
+     "$import": "nvfp4_static"
+    }
+   },
+   {
+    "quantizer_name": "*language_model.layers.*.mlp.*.input_quantizer",
+    "cfg": {
+     "$import": "nvfp4"
+    }
+   },
+   {
+    "quantizer_name": "*language_model.layers.*.self_attn.*_proj.weight_quantizer",
+    "cfg": {
+     "$import": "fp8"
+    }
+   },
+   {
+    "quantizer_name": "*language_model.layers.*.self_attn.*_proj.input_quantizer",
+    "cfg": {
+     "$import": "fp8"
+    }
+   },
+   {
+    "quantizer_name": "*language_model.layers.*.linear_attn.*_proj*.weight_quantizer",
+    "cfg": {
+     "$import": "fp8"
+    }
+   },
+   {
+    "quantizer_name": "*language_model.layers.*.linear_attn.*_proj*.input_quantizer",
+    "cfg": {
+     "$import": "fp8"
+    }
+   },
+   {
+    "quantizer_name": "*lm_head.weight_quantizer",
+    "cfg": {
+     "$import": "nvfp4_static"
+    }
+   },
+   {
+    "quantizer_name": "*lm_head.input_quantizer",
+    "cfg": {
+     "$import": "nvfp4"
+    }
+   },
+   {
+    "quantizer_name": "*language_model.layers.*.linear_attn.*_proj*.weight_quantizer",
+    "cfg": {
+     "$import": "nvfp4_static"
+    }
+   },
+   {
+    "quantizer_name": "*language_model.layers.*.linear_attn.*_proj*.input_quantizer",
+    "cfg": {
+     "$import": "nvfp4"
+    }
+   },
+   {
+    "quantizer_name": "*lm_head*",
+    "enable": false
+   },
+   {
+    "quantizer_name": "*linear_attn.in_proj_a*",
+    "enable": false
+   },
+   {
+    "quantizer_name": "*linear_attn.in_proj_b*",
+    "enable": false
+   }
+  ]
+ }
+}

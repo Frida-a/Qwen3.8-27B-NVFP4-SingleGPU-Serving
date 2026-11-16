@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:15:50 -0800
+Subject: [PATCH] [QW38] gdn recover fold: single-buffered u records (halves
+ the u side buffer)
+
+by_req (deferred-commit) records: u [HV, V] rows belong to exactly one verify
+program (i_v, request, value head), which replays its pending u rows before
+its token loop overwrites them, so u needs one copy of num_spec + 1 rows
+instead of two halves. k and g are shared across programs (value-tile and
+GQA programs replay the same rows) and stay double-buffered. The forced
+commit / prefill-row flush read the latest verify's j-th u record from row
+j (RU constexpr; other record layouts unchanged). k3: 56.4 -> 32.4 MiB per
+GDN layer at 256 request rows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/mamba/ops/gdn_recover_spec.py      | 50 ++++++++++++++++---
+ 1 file changed, 42 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index 038f6bac4..891849b33 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -277,6 +277,7 @@ def _gdn_recover_verify_kernel(
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+     DEFER: tl.constexpr = False,
+     HALF: tl.constexpr = 1,
++    RU: tl.constexpr = 0,
+ ):
+     i_v, i_nh = tl.program_id(0), tl.program_id(1)
+     i_n, i_hv = i_nh // HV, i_nh % HV
+@@ -322,7 +323,10 @@ def _gdn_recover_verify_kernel(
+     if DEFER:
+         # Records live in the request's side-buffer row (req_state index).
+         rec = tl.load(req_indices + i_n * stride_req_idx).to(tl.int64)
+-    p_u = rec_u + rec * stride_u_slot + i_hv * R * V + o_v
++    # u rows per head: R, or HALF when single-buffered (deferred commit).
++    RU_: tl.constexpr = R if RU == 0 else RU
++    U_SINGLE: tl.constexpr = DEFER and RU_ == HALF
++    p_u = rec_u + rec * stride_u_slot + i_hv * RU_ * V + o_v
+     p_rk = rec_k + rec * stride_rk_slot + i_h * R * K + o_k
+     p_g = rec_g + rec * stride_g_slot + i_hv * R
+     pos0 = 0
+@@ -336,9 +340,12 @@ def _gdn_recover_verify_kernel(
+         pending = tl.load(defer_pending + rec)
+         if pending > 0:
+             for j in range(0, pending):
++                # Single-buffered u: this program reads its pending u rows
++                # here, before the token loop below overwrites them.
++                ju = j if U_SINGLE else rd * HALF + j
+                 b_h = _gdn_replay_record(
+                     b_h,
+-                    p_u + (rd * HALF + j) * V,
++                    p_u + ju * V,
+                     p_rk + (rd * HALF + j) * K,
+                     p_g + rd * HALF + j,
+                     mask_k,
+@@ -394,7 +401,10 @@ def _gdn_recover_verify_kernel(
+ 
+         # Records instead of the per-token state store.
+         pos = (pos0 + i_t) % R
+-        tl.store(p_u + pos * V, b_v, mask=mask_v)
++        if U_SINGLE:
++            tl.store(p_u + i_t * V, b_v, mask=mask_v)
++        else:
++            tl.store(p_u + pos * V, b_v, mask=mask_v)
+         if i_v == 0:
+             tl.store(p_g + pos, b_g)
+         if store_k:
+@@ -420,8 +430,11 @@ class GDNRecoverRecords:
+     by_row=True: n = spec rows of a step (a per-layer buffer outside the KV
+     cache; W = 1 only, since every step folds its records).
+     by_req=True: n = request-table rows (deferred commit, see
+-    GDNRecoverDeferTrackers): R = 2 * (num_spec + 1), two halves used
+-    alternately by consecutive steps.
++    GDNRecoverDeferTrackers): k and g have R = 2 * (num_spec + 1), two halves
++    used alternately by consecutive steps (other programs still replay the
++    shared k/g rows of the previous step). u is single-buffered (num_spec + 1
++    rows): each u row belongs to exactly one verify program, which reads the
++    pending rows before it overwrites them.
+     """
+ 
+     u: torch.Tensor
+@@ -433,12 +446,23 @@ class GDNRecoverRecords:
+     @property
+     def half(self) -> int:
+         assert self.by_req
+-        return self.u.shape[2] // 2
++        return self.k.shape[2] // 2
+ 
+     @property
+     def ring_len(self) -> int:
++        """Rows of the k/g rings (and of u, except single-buffered by_req)."""
++        return self.k.shape[2]
++
++    @property
++    def u_len(self) -> int:
+         return self.u.shape[2]
+ 
++    @property
++    def u_single(self) -> bool:
++        """by_req u single-buffered: u row j holds the j-th record of the
++        latest verify, whichever k/g half it went to."""
++        return self.by_req and self.u.shape[2] == self.k.shape[2] // 2
++
+     @classmethod
+     def allocate(
+         cls,
+@@ -466,6 +490,8 @@ class GDNRecoverRecords:
+             num_spec,
+             num_spec + 1 if by_req else (0 if by_row else window),
+         )
++        if by_req:
++            u_shape = (num_v_heads, num_spec + 1, head_v_dim)
+         return cls(
+             torch.zeros((num_slots, *u_shape), dtype=torch.float32, device=device),
+             torch.zeros((num_slots, *k_shape), dtype=dtype, device=device),
+@@ -692,6 +718,7 @@ def gdn_recover_verify(
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+         DEFER=defer is not None,
+         HALF=R // 2 if defer is not None else 1,
++        RU=records.u_len,
+         num_warps=_NUM_WARPS,
+         num_stages=_NUM_STAGES,
+     )
+@@ -953,6 +980,7 @@ def _gdn_recover_commit_kernel(
+     RECORDS_BY_ROW: tl.constexpr,
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+     REC_FROM_PLAN: tl.constexpr = False,
++    RU: tl.constexpr = 0,
+ ):
+     """Fold planned records into the checkpoint, all layers of a group at once."""
+     i_v, i_n, i_lh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+@@ -1008,14 +1036,19 @@ def _gdn_recover_commit_kernel(
+         rec = i_n.to(tl.int64)
+     if REC_FROM_PLAN:
+         rec = tl.load(p_plan + 6).to(tl.int64)
+-    p_u = rec_u + rec * stride_u_slot + i_hv * R * V + o_v
++    # Single-buffered u (deferred commit): the latest verify's j-th record is
++    # u row j, whichever k/g half (start) it went to.
++    RU_: tl.constexpr = R if RU == 0 else RU
++    U_SINGLE: tl.constexpr = REC_FROM_PLAN and RU_ * 2 == R
++    p_u = rec_u + rec * stride_u_slot + i_hv * RU_ * V + o_v
+     p_rk = rec_k + rec * stride_rk_slot + i_h * R * K + o_k
+     p_g = rec_g + rec * stride_g_slot + i_hv * R
+     for j in range(0, count):
+         pos = (start + j) % R
++        ju = j if U_SINGLE else pos
+         b_h = _gdn_replay_record(
+             b_h,
+-            p_u + pos * V,
++            p_u + ju * V,
+             p_rk + pos * K,
+             p_g + pos,
+             mask_k,
+@@ -1149,6 +1182,7 @@ class GDNRecoverCommitGroup:
+             BK=BK,
+             BV=BV,
+             R=r0.ring_len,
++            RU=r0.u_len,
+             FMT=GDN_STATE_FORMATS[self.fmt],
+             RECORDS_BY_ROW=r0.by_row,
+             USE_QK_L2NORM_IN_KERNEL=self.use_qk_l2norm_in_kernel,

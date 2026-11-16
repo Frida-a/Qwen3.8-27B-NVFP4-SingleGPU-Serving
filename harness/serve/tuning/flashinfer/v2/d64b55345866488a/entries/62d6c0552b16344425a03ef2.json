@@ -1,0 +1,74 @@
+{
+  "key": "('fp8_gemm', 'CudnnFp8GemmRunner', ((1, 8, 5120), (1, 5120, 16384), (), (), (1, -1, 16384), (-1,)), (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.bfloat16))",
+  "key_fields": {
+    "__tuple__": [
+      "fp8_gemm",
+      "CudnnFp8GemmRunner",
+      {
+        "__tuple__": [
+          {
+            "__tuple__": [
+              1,
+              8,
+              5120
+            ]
+          },
+          {
+            "__tuple__": [
+              1,
+              5120,
+              16384
+            ]
+          },
+          {
+            "__tuple__": []
+          },
+          {
+            "__tuple__": []
+          },
+          {
+            "__tuple__": [
+              1,
+              -1,
+              16384
+            ]
+          },
+          {
+            "__tuple__": [
+              -1
+            ]
+          }
+        ]
+      },
+      {
+        "__tuple__": [
+          {
+            "__dtype__": "float8_e4m3fn"
+          },
+          {
+            "__dtype__": "float8_e4m3fn"
+          },
+          {
+            "__dtype__": "bfloat16"
+          }
+        ]
+      }
+    ]
+  },
+  "profiling_policy": [
+    "cuda_graph_profile_replays",
+    null,
+    "l2_cache_policy",
+    "hot"
+  ],
+  "runner": "CudnnFp8GemmRunner",
+  "tactic": [
+    10,
+    [
+      [
+        12,
+        16
+      ]
+    ]
+  ]
+}

@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:58:37 -0800
+Subject: [PATCH] [Attention] FlashInfer: opt-in SM120 FP8 prefill
+ (cute-dsl-prims FMHA)
+
+VLLM_FLASHINFER_SM120_FP8_PREFILL=1 on SM120 with an fp8_e4m3 KV cache runs
+causal prefill with FlashInfer's SM120 CuTe-DSL FP8 FMHA
+(BatchPrefillWithPagedKVCacheWrapper backend="cute-dsl-prims": E4M3 Q/K/V
+mma.sync, FP32 softmax/accumulate, BF16 output) instead of fa2 with BF16
+math. The prefill query is quantized with the layer's static q_scale, as on
+SM100 where trtllm-gen already runs E4M3 Q/K/V for fp8 KV caches. Decode
+(XQA, BF16 Q) is unchanged. Requires HND layout and a kernel page size in
+{16, 32, 64, 128}; fails loudly otherwise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/backends/flashinfer.py | 46 ++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 72c7a1ce3..94c61b6a5 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -7,6 +7,8 @@ from enum import Enum
+ from functools import partial
+ from typing import ClassVar
+ 
++import os
++
+ import numpy as np
+ import torch
+ from flashinfer import (
+@@ -987,6 +989,33 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             assert self.kv_cache_spec.dtype == self.model_config.dtype
+             self.kv_cache_dtype = self.kv_cache_spec.dtype
+ 
++        # SM120 FP8 prefill (opt-in, VLLM_FLASHINFER_SM120_FP8_PREFILL=1): run causal
++        # prefill with FlashInfer's SM120 CuTe-DSL FP8 FMHA (backend
++        # "cute-dsl-prims": E4M3 Q/K/V, FP32 softmax/accumulate, BF16 out) instead
++        # of fa2 with BF16 math. Q is quantized with the layer's static q_scale,
++        # as on SM100 trtllm-gen with an fp8 KV cache. Needs an fp8_e4m3 cache,
++        # HND layout and a kernel page size in {16, 32, 64, 128}.
++        self.sm120_fp8_prefill = (
++            os.environ.get("VLLM_FLASHINFER_SM120_FP8_PREFILL", "0") == "1"
++            and current_platform.is_device_capability(120)
++            and self.cache_dtype in ("fp8", "fp8_e4m3")
++            and not self.use_dcp
++        )
++        if self.sm120_fp8_prefill:
++            why = []
++            layout = get_flashinfer_layout_string(self.kv_cache_layout)
++            if layout != "HND":
++                why.append(f"kv cache layout {layout} (needs HND)")
++            if self.page_size not in (16, 32, 64, 128):
++                why.append(f"page size {self.page_size}")
++            if self.head_dim not in (32, 64, 128, 256):
++                why.append(f"head_dim {self.head_dim}")
++            if why:
++                raise ValueError(
++                    "VLLM_FLASHINFER_SM120_FP8_PREFILL=1 is not supported here: "
++                    + ", ".join(why)
++                )
++
+         # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and
+         # decode phases require different Q dtypes when the KV cache is FP8
+         # (FP8-Q for the FI native prefill, BF16/FP16-Q for XQA decode),
+@@ -1180,6 +1209,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         ):
+             return self.model_config.dtype
+ 
++        if is_prefill and getattr(self, "sm120_fp8_prefill", False):
++            return FlashInferBackend.get_dtype_for_flashinfer(cache_dtype)
++
+         # Otherwise, match Q dtype to the KV cache dtype.
+         if cache_dtype.startswith("fp8"):
+             # FP8-Q requires an fp8 tensor-core attention path. SM90 uses
+@@ -1475,6 +1507,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     # NVFP4 KV cache requires the trtllm-gen backend inside
+                     # the wrapper on SM100; SM8x, SM90 and SM12x read it with fa2.
+                     backend = "trtllm-gen" if self.nvfp4_trtllm else "auto"
++                    if self.sm120_fp8_prefill:
++                        if (
++                            self.window_left != -1
++                            or self.logits_soft_cap
++                            or self.has_sinks
++                        ):
++                            raise ValueError(
++                                "SM120 FP8 prefill: no sliding window, soft cap or "
++                                "sinks"
++                            )
++                        backend = "cute-dsl-prims"
++                        logger.info_once(
++                            "FlashInfer prefill: SM120 FP8 FMHA (cute-dsl-prims)"
++                        )
+                     self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                         self._get_workspace_buffer(),
+                         get_flashinfer_layout_string(self.kv_cache_layout),

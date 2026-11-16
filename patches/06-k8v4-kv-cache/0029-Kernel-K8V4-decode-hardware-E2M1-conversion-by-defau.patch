@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 01:02:43 -0800
+Subject: [PATCH] [Kernel] K8V4 decode: hardware E2M1 conversion by default on
+ SM100/SM120
+
+GB300: 5-14% faster than the integer bit trick across
+1K/32K x c 1/16/64 x qlen 1/4 (e.g. 32K c=64 qlen 4: 2116 vs 2458 us);
+31/31 unit tests incl. HW vs integer path (max diff 1e-3). VLLM_K8V4_HW_CVT=0
+restores the integer path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/ops/k8v4_kv.py | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/attention/ops/k8v4_kv.py b/vllm/v1/attention/ops/k8v4_kv.py
+index cae1fb475..a6b5b607b 100644
+--- a/vllm/v1/attention/ops/k8v4_kv.py
++++ b/vllm/v1/attention/ops/k8v4_kv.py
+@@ -435,6 +435,15 @@ def _num_sms(device: torch.device) -> int:
+     return _SM_COUNT[idx]
+ 
+ 
++def _hw_cvt_enabled(device: torch.device) -> bool:
++    """cvt.rn.f16x2.e2m1x2 needs sm_100a / sm_120a (default on there);
++    VLLM_K8V4_HW_CVT=0 forces the integer-trick dequant."""
++    env = os.environ.get("VLLM_K8V4_HW_CVT", "")
++    if env in ("0", "1"):
++        return env == "1"
++    return torch.cuda.get_device_capability(device)[0] in (10, 12)
++
++
+ def k8v4_num_splits(num_reqs: int, num_kv_heads: int, device: torch.device) -> int:
+     """Static split count (a function of the padded batch only, so CUDA-graph
+     replays keep the captured grid). VLLM_K8V4_DECODE_SPLITS overrides."""
+@@ -531,7 +540,7 @@ def k8v4_decode(
+         QLEN=q_len_per_req,
+         RAGGED=ragged,
+         SCALE_BCAST=os.environ.get("VLLM_K8V4_SCALE_BCAST", "1") == "1",
+-        HW_CVT=os.environ.get("VLLM_K8V4_HW_CVT", "0") == "1",
++        HW_CVT=_hw_cvt_enabled(query.device),
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )

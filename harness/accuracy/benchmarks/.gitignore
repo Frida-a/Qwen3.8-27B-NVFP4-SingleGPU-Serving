@@ -1,0 +1,3 @@
+# Built benchmark data and the run copies written by run_gym.sh (tools/repeat_overrides.py).
+*/data/
+*_run/

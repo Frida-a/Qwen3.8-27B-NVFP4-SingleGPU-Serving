@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:51:47 -0800
+Subject: [PATCH] [Kernel] K8V4 decode: optional hardware E2M1x2 -> f16x2
+ conversion
+
+VLLM_K8V4_HW_CVT=1 decodes V bytes with cvt.rn.f16x2.e2m1x2 (sm_100a /
+sm_120a) via inline PTX: one instruction per two elements instead of the
+integer bit trick. Exact either way (FP16 holds every E2M1 x E4M3 product).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/attention/test_k8v4_kv.py | 20 ++++++++++++++++
+ vllm/v1/attention/ops/k8v4_kv.py        | 32 ++++++++++++++++++++++---
+ 2 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/tests/kernels/attention/test_k8v4_kv.py b/tests/kernels/attention/test_k8v4_kv.py
+index 245ed3ba0..bfe0d81c9 100644
+--- a/tests/kernels/attention/test_k8v4_kv.py
++++ b/tests/kernels/attention/test_k8v4_kv.py
+@@ -253,3 +253,23 @@ def test_mock_paged():
+             assert torch.equal(mock[dst, 0].float().to(torch.bfloat16), kf[src])
+             exp_v = vf[src].float().clamp(-448, 448).to(FP8_DTYPE)
+             assert torch.equal(mock[dst, 1].view(torch.uint8), exp_v.view(torch.uint8))
++
++
++@pytest.mark.parametrize("qlen", [1, 4])
++def test_decode_hw_cvt(monkeypatch, qlen):
++    """VLLM_K8V4_HW_CVT=1 (cvt.rn.f16x2.e2m1x2) == the integer-trick path."""
++    if torch.cuda.get_device_capability()[0] not in (10, 12):
++        pytest.skip("e2m1x2 cvt needs sm_100a / sm_120a")
++    seqs, qls = [3000, 77], [qlen, qlen]
++    cache, bt, sl, ql, qcu, q = _setup_decode(seqs, qls, 64, seed=9)
++    scale = 1.0 / math.sqrt(D)
++    ref_out = torch.empty_like(q)
++    monkeypatch.setenv("VLLM_K8V4_HW_CVT", "0")
++    k8v4_decode(q, cache, bt, sl, ref_out, scale, q_len_per_req=qlen, num_splits=3)
++    out = torch.empty_like(q)
++    monkeypatch.setenv("VLLM_K8V4_HW_CVT", "1")
++    k8v4_decode(q, cache, bt, sl, out, scale, q_len_per_req=qlen, num_splits=3)
++    kf, vf = k8v4_read_cache_ref(cache, D)
++    ref, mag = _ref_attention(q, kf, vf, bt, sl, qcu[:-1], ql, scale)
++    _check(out, ref, mag)
++    print("hw_cvt vs int path max diff", (out.float() - ref_out.float()).abs().max().item())
+diff --git a/vllm/v1/attention/ops/k8v4_kv.py b/vllm/v1/attention/ops/k8v4_kv.py
+index b7322d914..cae1fb475 100644
+--- a/vllm/v1/attention/ops/k8v4_kv.py
++++ b/vllm/v1/attention/ops/k8v4_kv.py
+@@ -110,6 +110,21 @@ def _e2m1_f16_scaled(c):
+     return bits.to(tl.int16).to(tl.float16, bitcast=True)
+ 
+ 
++@triton.jit
++def _e2m1x2_cvt(byte):
++    """Hardware E2M1x2 -> f16x2 (sm_100a/sm_120a PTX): packed byte (int16 lane)
++    -> (low-nibble value, high-nibble value) as exact FP16."""
++    return tl.inline_asm_elementwise(
++        "{ .reg .b8 t; .reg .b32 r; cvt.u8.u16 t, $2; "
++        "cvt.rn.f16x2.e2m1x2 r, t; mov.b32 {$0, $1}, r; }",
++        "=h,=h,h",
++        [byte],
++        dtype=(tl.float16, tl.float16),
++        is_pure=True,
++        pack=1,
++    )
++
++
+ @triton.jit
+ def _quant_nvfp4_half(b, HALF: tl.constexpr):
+     """[HALF] fp32 (already / g) -> (codes int32 [HALF], fp8 block scales [HALF/16])."""
+@@ -260,6 +275,7 @@ def _k8v4_decode_stage1(
+     QLEN: tl.constexpr,
+     RAGGED: tl.constexpr,
+     SCALE_BCAST: tl.constexpr,
++    HW_CVT: tl.constexpr,
+ ):
+     HALF: tl.constexpr = HEAD_DIM // 2
+     b = tl.program_id(0)
+@@ -343,14 +359,23 @@ def _k8v4_decode_stage1(
+             )
+             sc_lo = sc_lo.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+             sc_hi = sc_hi.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+-        v_lo = _e2m1_f16_scaled(vd & 15) * sc_lo
+-        v_hi = _e2m1_f16_scaled(vd >> 4) * sc_hi
++        if HW_CVT:
++            c_lo, c_hi = _e2m1x2_cvt(vd.to(tl.int16))
++            v_lo = c_lo * sc_lo
++            v_hi = c_hi * sc_hi
++        else:
++            v_lo = _e2m1_f16_scaled(vd & 15) * sc_lo
++            v_hi = _e2m1_f16_scaled(vd >> 4) * sc_hi
+         acc_lo = acc_lo * alpha[:, None] + tl.dot(p16, v_lo)
+         acc_hi = acc_hi * alpha[:, None] + tl.dot(p16, v_hi)
+         m_i = m_new
+ 
+     has = l_i > 0.0
+-    inv = tl.where(has, (16384.0 * v_scale) / tl.where(has, l_i, 1.0), 0.0)
++    if HW_CVT:
++        vfac = v_scale
++    else:
++        vfac = 16384.0 * v_scale
++    inv = tl.where(has, vfac / tl.where(has, l_i, 1.0), 0.0)
+     o_lo = acc_lo * inv[:, None]
+     o_hi = acc_hi * inv[:, None]
+     if NUM_SPLITS == 1:
+@@ -506,6 +531,7 @@ def k8v4_decode(
+         QLEN=q_len_per_req,
+         RAGGED=ragged,
+         SCALE_BCAST=os.environ.get("VLLM_K8V4_SCALE_BCAST", "1") == "1",
++        HW_CVT=os.environ.get("VLLM_K8V4_HW_CVT", "0") == "1",
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )

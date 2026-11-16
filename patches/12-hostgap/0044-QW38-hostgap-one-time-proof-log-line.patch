@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:44:57 -0800
+Subject: [PATCH] [QW38] hostgap: one-time proof log line
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/backends/flashinfer.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index cbed475a5..7f25255c0 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -1844,6 +1844,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         needs_seq_lens_cpu = self.use_dcp or not (
+             all_uses_trtllm or noncausal_trtllm_decode_only
+         )
++        if noncausal_trtllm_decode_only and not self.use_dcp:
++            logger.info_once(
++                "QW38 hostgap: non-causal trtllm-api decode-only batch; "
++                "host seq_lens read skipped."
++            )
+         if needs_seq_lens_cpu:
+             if (
+                 self._num_speculative_tokens == 0

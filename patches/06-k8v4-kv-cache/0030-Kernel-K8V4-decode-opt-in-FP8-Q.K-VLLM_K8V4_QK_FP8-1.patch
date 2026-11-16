@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:37:37 -0800
+Subject: [PATCH] [Kernel] K8V4 decode: opt-in FP8 Q.K (VLLM_K8V4_QK_FP8=1)
+
+E4M3 query (layer q_scale) and an FP8 QK MMA on the FP8 K tile: no K
+conversion. Same numerics class as the trtllm-gen fp8-KV decode on SM100
+(FP8 Q); off by default (needs its own accuracy check).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/attention/test_k8v4_kv.py | 14 ++++++++++++++
+ vllm/v1/attention/ops/k8v4_kv.py        | 23 ++++++++++++++++++++---
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/tests/kernels/attention/test_k8v4_kv.py b/tests/kernels/attention/test_k8v4_kv.py
+index bfe0d81c9..d5b5ffe9f 100644
+--- a/tests/kernels/attention/test_k8v4_kv.py
++++ b/tests/kernels/attention/test_k8v4_kv.py
+@@ -273,3 +273,17 @@ def test_decode_hw_cvt(monkeypatch, qlen):
+     ref, mag = _ref_attention(q, kf, vf, bt, sl, qcu[:-1], ql, scale)
+     _check(out, ref, mag)
+     print("hw_cvt vs int path max diff", (out.float() - ref_out.float()).abs().max().item())
++
++
++@pytest.mark.parametrize("qlen", [1, 4])
++def test_decode_qk_fp8(qlen):
++    """Opt-in FP8 Q.K: equals the FP32 reference with an E4M3-rounded query."""
++    seqs, qls = [2000, 64], [qlen, qlen]
++    cache, bt, sl, ql, qcu, q = _setup_decode(seqs, qls, 64, seed=13)
++    scale = 1.0 / math.sqrt(D)
++    out = torch.empty_like(q)
++    k8v4_decode(q, cache, bt, sl, out, scale, q_len_per_req=qlen, num_splits=3, qk_fp8=True)
++    kf, vf = k8v4_read_cache_ref(cache, D)
++    q8 = q.float().clamp(-448, 448).to(FP8_DTYPE).to(torch.bfloat16)
++    ref, mag = _ref_attention(q8, kf, vf, bt, sl, qcu[:-1], ql, scale)
++    _check(out, ref, mag)
+diff --git a/vllm/v1/attention/ops/k8v4_kv.py b/vllm/v1/attention/ops/k8v4_kv.py
+index a6b5b607b..1c3cb8b5f 100644
+--- a/vllm/v1/attention/ops/k8v4_kv.py
++++ b/vllm/v1/attention/ops/k8v4_kv.py
+@@ -276,6 +276,7 @@ def _k8v4_decode_stage1(
+     RAGGED: tl.constexpr,
+     SCALE_BCAST: tl.constexpr,
+     HW_CVT: tl.constexpr,
++    QK_FP8: tl.constexpr,
+ ):
+     HALF: tl.constexpr = HEAD_DIM // 2
+     b = tl.program_id(0)
+@@ -300,7 +301,12 @@ def _k8v4_decode_stage1(
+         q_ptr + trow[:, None] * stride_qt + qh[:, None] * stride_qh + d[None, :],
+         mask=row_ok[:, None],
+         other=0.0,
+-    ).to(tl.float16)
++    )
++    if QK_FP8:
++        # E4M3 query (scale folded into qk_scale_log2 by the wrapper), FP8 QK MMA
++        q = tl.clamp(q.to(tl.float32), -448.0, 448.0).to(tl.float8e4nv)
++    else:
++        q = q.to(tl.float16)
+     qpos = seq_len - ql + tq
+ 
+     num_tiles = tl.cdiv(seq_len, BLOCK_N)
+@@ -328,7 +334,9 @@ def _k8v4_decode_stage1(
+             mask=kv_ok[:, None],
+             other=0,
+         )
+-        kt = kt.to(tl.float8e4nv, bitcast=True).to(tl.float16)
++        kt = kt.to(tl.float8e4nv, bitcast=True)
++        if not QK_FP8:
++            kt = kt.to(tl.float16)
+         s = tl.dot(q, tl.trans(kt)) * qk_scale_log2
+         allowed = (kvpos[None, :] <= qpos[:, None]) & kv_ok[None, :]
+         s = tl.where(allowed, s, float("-inf"))
+@@ -470,6 +478,8 @@ def k8v4_decode(
+     block_n: int | None = None,
+     num_warps: int = 4,
+     num_stages: int = 2,
++    qk_fp8: bool | None = None,
++    q_scale: float = 1.0,
+ ) -> torch.Tensor:
+     """Decode / verify attention over a K8V4 cache.
+ 
+@@ -498,6 +508,12 @@ def k8v4_decode(
+     block_n = max(block_n, 16)
+     assert block_n % page == 0 or page % block_n == 0, (block_n, page)
+     ragged = q_cu_seq_lens is not None
++    if qk_fp8 is None:
++        # opt-in: E4M3 query and FP8 QK MMA (the trtllm-gen fp8-KV decode class)
++        qk_fp8 = os.environ.get("VLLM_K8V4_QK_FP8", "0") == "1"
++    if qk_fp8 and q_scale != 1.0:
++        query = query / q_scale
++    qk_mult = sm_scale * k_scale * (q_scale if qk_fp8 else 1.0)
+     if num_splits > 1:
+         mid_l = torch.empty(
+             (num_tokens, num_q_heads, num_splits), dtype=torch.float32, device=query.device
+@@ -528,7 +544,7 @@ def k8v4_decode(
+         out3,
+         out3.stride(0),
+         out3.stride(1),
+-        float(sm_scale * k_scale * 1.4426950408889634),
++        float(qk_mult * 1.4426950408889634),
+         float(v_scale),
+         NUM_Q_HEADS=num_q_heads,
+         GROUP=group,
+@@ -541,6 +557,7 @@ def k8v4_decode(
+         RAGGED=ragged,
+         SCALE_BCAST=os.environ.get("VLLM_K8V4_SCALE_BCAST", "1") == "1",
+         HW_CVT=_hw_cvt_enabled(query.device),
++        QK_FP8=qk_fp8,
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )

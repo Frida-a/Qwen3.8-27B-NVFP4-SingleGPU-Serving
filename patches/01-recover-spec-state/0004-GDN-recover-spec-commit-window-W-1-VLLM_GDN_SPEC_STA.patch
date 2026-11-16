@@ -1,0 +1,775 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:21:24 -0800
+Subject: [PATCH] [GDN] recover spec: commit window W > 1
+ (VLLM_GDN_SPEC_STATE_W)
+
+With VLLM_GDN_SPEC_STATE=recover, VLLM_GDN_SPEC_STATE_W=W (default 1) keeps
+accepted records pending in the ring and folds them into the state only once
+W tokens are pending; the verify replays the pending records in registers
+(same FMA order), so outputs stay bit-identical to the per-token path.
+
+- Ring rows R = W + num_spec + 1 (page layout from the shape calculator).
+- Per-slot ring trackers (ring_start, num_pending) per cache group, bound with
+  the KV cache by initialize_replayssm_ring_trackers (extended to GDN layers
+  with uses_gdn_recover_trackers); verify and commit read them.
+- Flush: the metadata builder (build and update_block_table) force-folds the
+  pending records of every non-spec row (prefill chunks incl. resumed /
+  preempted requests, non-spec decodes) before the forward and resets their
+  trackers; a fresh request reusing a slot thereby drops its previous owner's
+  trackers. GDNRecoverCommitGroup.flush(slots) does a forced fold.
+- Tests: kernel multi-step W = 1..4, flush at finish/preemption and slot
+  reuse; model path recover (W = 1, 2, 4) vs per_token, and recover W = 3 vs
+  W = 1 across a prefill chunk reading a slot with pending records and a slot
+  reused by a new request.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mamba/test_gdn_recover_model_path.py      | 343 +++++++++++-------
+ tests/kernels/mamba/test_gdn_recover_spec.py  |  48 ++-
+ vllm/envs.py                                  |   5 +
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  |  22 +-
+ .../layers/mamba/mamba_utils.py               |   9 +
+ .../layers/mamba/ops/gdn_recover_spec.py      |  10 +
+ vllm/v1/attention/backends/gdn_attn.py        |  43 +++
+ .../worker/gpu/model_states/mamba_hybrid.py   |   6 +-
+ vllm/v1/worker/replayssm_utils.py             |   6 +-
+ 9 files changed, 359 insertions(+), 133 deletions(-)
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_model_path.py b/tests/kernels/mamba/test_gdn_recover_model_path.py
+index 0b740d6aa..f4c29e793 100644
+--- a/tests/kernels/mamba/test_gdn_recover_model_path.py
++++ b/tests/kernels/mamba/test_gdn_recover_model_path.py
+@@ -3,9 +3,13 @@
+ """Model path of VLLM_GDN_SPEC_STATE=recover vs the per-token Triton path.
+ 
+ Runs QwenGatedDeltaNetAttention._forward_core with real GDN metadata for
+-several speculative steps in both modes, committing the recover mode's
+-records after each step as the model runner does. Outputs, convolution
+-states and accepted recurrent states must be bit-identical.
++several steps, committing the recover mode's records after each step as the
++model runner does. Outputs, convolution states and accepted recurrent states
++must be bit-identical:
++- pure speculative steps: recover (commit window W = 1..4) vs per_token;
++- W > 1 with a prefill chunk reading a slot that has pending records
++  (resumed / preempted request) and a slot reused by a new request: recover
++  W = 3 vs recover W = 1 (the per-token path cannot run those transitions).
+ """
+ 
+ import os
+@@ -28,6 +32,7 @@ from tests.v1.attention.utils import (  # noqa: E402
+ from vllm.config import SpeculativeConfig, set_current_vllm_config  # noqa: E402
+ from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn  # noqa: E402
+ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa: E402
++    ChunkGatedDeltaRule,
+     QwenGatedDeltaNetAttention,
+ )
+ from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
+@@ -48,6 +53,7 @@ BLOCK_SIZE = 16
+ PREFIX = "model.layers.0.linear_attn"
+ # Any Qwen3.5-family config works; override with a local path when offline.
+ MODEL = os.environ.get("GDN_RECOVER_TEST_MODEL", "Qwen/Qwen3.5-0.8B")
++DEV = torch.device("cuda")
+ 
+ 
+ def _bits(x):
+@@ -68,68 +74,17 @@ def _make_vllm_config():
+     return config
+ 
+ 
+-def _layer(vllm_config, kv_cache, params, recover):
+-    a_log, dt_bias, conv_weight = params
+-    layer = types.SimpleNamespace(
+-        prefix=PREFIX,
+-        enable_packed_recurrent_decode=False,
+-        tp_size=1,
+-        num_k_heads=H,
+-        num_v_heads=HV,
+-        head_k_dim=K,
+-        head_v_dim=V,
+-        key_dim=H * K,
+-        value_dim=HV * V,
+-        activation="silu",
+-        A_log=a_log,
+-        dt_bias=dt_bias,
+-        conv1d=types.SimpleNamespace(weight=conv_weight, bias=None),
+-        kv_cache=kv_cache,
+-        num_spec=NUM_SPEC,
+-        spec_recover=recover,
+-        gdn_decode_kernel="triton",
+-    )
+-    for name in ("rearrange_mixed_qkv", "_forward_core", "_recover_spec_verify"):
+-        setattr(
+-            layer,
+-            name,
+-            types.MethodType(getattr(QwenGatedDeltaNetAttention, name), layer),
+-        )
+-    return layer
+-
+-
+-@pytest.mark.parametrize("num_reqs", [1, 5])
+-@torch.inference_mode()
+-def test_recover_matches_per_token_path(monkeypatch, num_reqs):
+-    torch.manual_seed(0)
+-    dev = torch.device("cuda")
+-    steps = 5
+-    gen = torch.Generator().manual_seed(num_reqs)
+-    conv_shape, ssm_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
+-        1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
+-    )[:2]
+-    conv0 = 0.05 * torch.randn(num_reqs, *conv_shape, device=dev).to(torch.bfloat16)
+-    ssm0 = 0.05 * torch.randn(num_reqs, *ssm_shape, device=dev)
+-    params = (
+-        torch.log(torch.rand(HV, device=dev) * 15 + 1),
+-        0.1 * torch.randn(HV, device=dev),
+-        0.3 * torch.randn(CONV_DIM, 1, CONV_KERNEL, device=dev).to(torch.bfloat16),
+-    )
+-    inputs = [
+-        (
+-            torch.randn(num_reqs * T, CONV_DIM, device=dev).to(torch.bfloat16),
+-            torch.randn(num_reqs * T, 2 * HV, device=dev).to(torch.bfloat16),
+-        )
+-        for _ in range(steps)
+-    ]
+-    accepted = torch.randint(1, T + 1, (steps, num_reqs), generator=gen).to(torch.int32)
++class _Run:
++    """One GDN layer + builder in per_token or recover(window) mode."""
+ 
+-    results = {}
+-    for recover in (False, True):
+-        monkeypatch.setenv("VLLM_GDN_SPEC_STATE", "recover" if recover else "per_token")
+-        vllm_config = _make_vllm_config()
++    def __init__(self, monkeypatch, mode, window, num_reqs, init, params):
++        recover = mode == "recover"
++        monkeypatch.setenv("VLLM_GDN_SPEC_STATE", mode)
++        monkeypatch.setenv("VLLM_GDN_SPEC_STATE_W", str(window))
++        self.recover, self.num_reqs = recover, num_reqs
++        self.vllm_config = _make_vllm_config()
+         cols = 1 if recover else T
+-        builder = GDNAttentionMetadataBuilder(
++        self.builder = GDNAttentionMetadataBuilder(
+             kv_cache_spec=MambaSpec(
+                 block_size=BLOCK_SIZE,
+                 shapes=((16, 64),),
+@@ -137,75 +92,209 @@ def test_recover_matches_per_token_path(monkeypatch, num_reqs):
+                 num_speculative_blocks=cols - 1,
+             ),
+             layer_names=[PREFIX],
+-            vllm_config=vllm_config,
+-            device=dev,
++            vllm_config=self.vllm_config,
++            device=DEV,
+         )
+-        assert builder.spec_recover == recover
++        assert self.builder.spec_recover == recover
+         num_slots = 1 + num_reqs * cols
+-        table = 1 + torch.arange(num_reqs * cols, device=dev, dtype=torch.int32)
+-        table = table.view(num_reqs, cols)
+-        conv = torch.zeros(num_slots, *conv_shape, device=dev, dtype=torch.bfloat16)
+-        ssm = torch.zeros(num_slots, *ssm_shape, device=dev)
+-        conv[table[:, 0].long()] = conv0
+-        ssm[table[:, 0].long()] = ssm0
++        table = 1 + torch.arange(num_reqs * cols, device=DEV, dtype=torch.int32)
++        self.table = table.view(num_reqs, cols)
++        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
++            1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
++        )
++        assert len(shapes) == (5 if recover else 2)
++        conv = torch.zeros(num_slots, *shapes[0], device=DEV, dtype=torch.bfloat16)
++        ssm = torch.zeros(num_slots, *shapes[1], device=DEV)
++        conv[self.table[:, 0].long()], ssm[self.table[:, 0].long()] = init
+         kv_cache = (conv, ssm)
+         if recover:
+-            shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+-                1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
+-            )
+-            assert len(shapes) == 5
++            assert shapes[2][1] == window + NUM_SPEC + 1
+             kv_cache += (
+-                torch.zeros(num_slots, *shapes[2], device=dev),
+-                torch.zeros(num_slots, *shapes[3], device=dev, dtype=torch.bfloat16),
+-                torch.zeros(num_slots, *shapes[4], device=dev),
++                torch.zeros(num_slots, *shapes[2], device=DEV),
++                torch.zeros(num_slots, *shapes[3], device=DEV, dtype=torch.bfloat16),
++                torch.zeros(num_slots, *shapes[4], device=DEV),
+             )
+-        layer = _layer(vllm_config, kv_cache, params, recover)
+-        vllm_config.compilation_config.static_forward_context[PREFIX] = layer
+-        outs = []
+-        prev_acc = torch.ones(num_reqs, dtype=torch.int32, device=dev)
+-        for s in range(steps):
+-            batch = BatchSpec(
+-                seq_lens=[64 + T * (s + 1)] * num_reqs, query_lens=[T] * num_reqs
++        a_log, dt_bias, conv_weight = params
++        layer = types.SimpleNamespace(
++            prefix=PREFIX,
++            enable_packed_recurrent_decode=False,
++            tp_size=1,
++            num_k_heads=H,
++            num_v_heads=HV,
++            head_k_dim=K,
++            head_v_dim=V,
++            key_dim=H * K,
++            value_dim=HV * V,
++            activation="silu",
++            A_log=a_log,
++            dt_bias=dt_bias,
++            conv1d=types.SimpleNamespace(weight=conv_weight, bias=None),
++            kv_cache=kv_cache,
++            num_spec=NUM_SPEC,
++            spec_recover=recover,
++            recover_window=window if recover else 1,
++            uses_gdn_recover_trackers=recover and window > 1,
++            _replayssm_ring_start=torch.zeros(num_slots, dtype=torch.int32, device=DEV),
++            _replayssm_prev_num_accepted=torch.zeros(
++                num_slots, dtype=torch.int32, device=DEV
++            ),
++            gdn_decode_kernel="triton",
++        )
++        with set_current_vllm_config(self.vllm_config):
++            layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
++        layer.gdn_prefill_backend = layer.chunk_gated_delta_rule.gdn_prefill_backend
++        for name in ("rearrange_mixed_qkv", "_forward_core", "_recover_spec_verify"):
++            fn = getattr(QwenGatedDeltaNetAttention, name)
++            setattr(layer, name, types.MethodType(fn, layer))
++        self.layer = layer
++        self.vllm_config.compilation_config.static_forward_context[PREFIX] = layer
++        self.conv, self.ssm = conv, ssm
++        self.prev_acc = torch.ones(num_reqs, dtype=torch.int32, device=DEV)
++
++    def step(self, seq_lens, query_lens, drafts, mixed_qkv, ba, num_sampled):
++        batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
++        common = create_common_attn_metadata(batch, BLOCK_SIZE, DEV)
++        common = common.replace(block_table_tensor=self.table)
++        with set_current_vllm_config(self.vllm_config):
++            meta = self.builder.build(
++                common_prefix_len=0,
++                common_attn_metadata=common,
++                num_accepted_tokens=self.prev_acc.clone(),
++                num_decode_draft_tokens_cpu=torch.tensor(drafts, dtype=torch.int32),
+             )
+-            common = create_common_attn_metadata(batch, BLOCK_SIZE, dev)
+-            common = common.replace(block_table_tensor=table)
+-            with set_current_vllm_config(vllm_config):
+-                meta = builder.build(
+-                    common_prefix_len=0,
+-                    common_attn_metadata=common,
+-                    num_accepted_tokens=prev_acc.clone(),
+-                    num_decode_draft_tokens_cpu=torch.full(
+-                        (num_reqs,), NUM_SPEC, dtype=torch.int32
+-                    ),
+-                )
+-            assert isinstance(meta, GDNRecoverSpecMetadata) == recover
+-            mixed_qkv, ba = inputs[s]
+-            out = torch.zeros(num_reqs * T, HV, V, device=dev, dtype=torch.bfloat16)
+-            context = types.SimpleNamespace(attn_metadata={PREFIX: meta})
+-            with patch.object(
+-                qwen_gdn_linear_attn, "get_forward_context", return_value=context
+-            ):
+-                layer._forward_core(
+-                    mixed_qkv=mixed_qkv.clone(),
+-                    b=ba[:, :HV],
+-                    a=ba[:, HV:],
+-                    core_attn_out=out,
+-                )
+-            outs.append(out)
+-            acc = accepted[s].to(dev)
+-            if recover:
+-                meta.commit_recoverssm_state(acc)
+-            prev_acc = acc
+-        if recover:
+-            final = ssm[table[:, 0].long()]
+-        else:
+-            final = ssm[table[torch.arange(num_reqs), prev_acc.long() - 1].long()]
+-        results[recover] = (outs, conv[table[:, 0].long()].clone(), final.clone())
+-
+-    (o0, c0, s0), (o1, c1, s1) = results[False], results[True]
+-    assert all(torch.isfinite(o.float()).all() for o in o0)
+-    assert torch.isfinite(s0).all()
++        assert isinstance(meta, GDNRecoverSpecMetadata) == self.recover
++        out = torch.zeros(sum(query_lens), HV, V, device=DEV, dtype=torch.bfloat16)
++        context = types.SimpleNamespace(attn_metadata={PREFIX: meta})
++        with patch.object(
++            qwen_gdn_linear_attn, "get_forward_context", return_value=context
++        ):
++            self.layer._forward_core(
++                mixed_qkv=mixed_qkv.clone(),
++                b=ba[:, :HV],
++                a=ba[:, HV:],
++                core_attn_out=out,
++            )
++        if self.recover:
++            meta.commit_recoverssm_state(num_sampled)
++        self.prev_acc = num_sampled.clamp_min(1)
++        return out
++
++    def final_states(self):
++        """Accepted state per request (recover: after a forced fold)."""
++        if self.recover:
++            if self.layer.recover_window > 1:
++                self.builder.recover_commit_group().flush(self.table[:, 0])
++            return self.ssm[self.table[:, 0].long()].clone()
++        rows = torch.arange(self.num_reqs)
++        return self.ssm[self.table[rows, self.prev_acc.long() - 1].long()].clone()
++
++
++def _setup(num_reqs, seed):
++    torch.manual_seed(seed)
++    shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
++        1, H, HV, K, V, CONV_KERNEL, 0
++    )
++    conv_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
++        1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
++    )[0]
++    init = (
++        0.05 * torch.randn(num_reqs, *conv_shape, device=DEV).to(torch.bfloat16),
++        0.05 * torch.randn(num_reqs, *shapes[1], device=DEV),
++    )
++    params = (
++        torch.log(torch.rand(HV, device=DEV) * 15 + 1),
++        0.1 * torch.randn(HV, device=DEV),
++        0.3 * torch.randn(CONV_DIM, 1, CONV_KERNEL, device=DEV).to(torch.bfloat16),
++    )
++    return init, params
++
++
++def _inputs(num_tokens):
++    return (
++        torch.randn(num_tokens, CONV_DIM, device=DEV).to(torch.bfloat16),
++        torch.randn(num_tokens, 2 * HV, device=DEV).to(torch.bfloat16),
++    )
++
++
++def _assert_same(a, b, what):
++    assert torch.isfinite(b.float()).all(), f"{what}: non-finite reference"
++    assert torch.equal(_bits(a), _bits(b)), what
++
++
++@pytest.mark.parametrize("window", [1, 2, 4])
++@pytest.mark.parametrize("num_reqs", [1, 5])
++@torch.inference_mode()
++def test_recover_matches_per_token_path(monkeypatch, num_reqs, window):
++    steps = 6
++    init, params = _setup(num_reqs, seed=num_reqs)
++    gen = torch.Generator().manual_seed(num_reqs * 10 + window)
++    inputs = [_inputs(num_reqs * T) for _ in range(steps)]
++    accepted = torch.randint(1, T + 1, (steps, num_reqs), generator=gen).to(torch.int32)
++    results = {}
++    for mode in ("per_token", "recover"):
++        run = _Run(monkeypatch, mode, window, num_reqs, init, params)
++        outs = [
++            run.step(
++                [64 + T * (s + 1)] * num_reqs,
++                [T] * num_reqs,
++                [NUM_SPEC] * num_reqs,
++                *inputs[s],
++                accepted[s].to(DEV),
++            )
++            for s in range(steps)
++        ]
++        conv = run.conv[run.table[:, 0].long()].clone()
++        results[mode] = (outs, conv, run.final_states())
++
++    (o0, c0, s0), (o1, c1, s1) = results["per_token"], results["recover"]
+     for s in range(steps):
+-        assert torch.equal(_bits(o1[s]), _bits(o0[s])), f"output step {s}"
+-    assert torch.equal(_bits(c1), _bits(c0)), "conv state"
+-    assert torch.equal(_bits(s1), _bits(s0)), "accepted ssm state"
++        _assert_same(o1[s], o0[s], f"output step {s}")
++    _assert_same(c1, c0, "conv state")
++    _assert_same(s1, s0, "accepted ssm state")
++
++
++@torch.inference_mode()
++def test_window_prefill_reads_and_slot_reuse(monkeypatch):
++    """Request A keeps decoding; request B is resumed as a prefill chunk
++    (reads its state with records pending), then finishes and its slot goes
++    to a new request C (fresh prefill, stale trackers)."""
++    init, params = _setup(2, seed=7)
++    gen = torch.Generator().manual_seed(7)
++    # (seq_lens, query_lens, drafts): A first (spec decodes lead the batch).
++    schedule = [
++        ([70, 70], [T, T], [3, 3]),
++        ([74, 74], [T, T], [3, 3]),
++        ([78, 78], [T, T], [3, 3]),
++        ([82, 90], [T, 3], [3, -1]),  # B: prefill chunk with initial state
++        ([86, 94], [T, T], [3, 3]),
++        ([90, 5], [T, 5], [3, -1]),  # C reuses B's slot: fresh prefill
++        ([94, 9], [T, T], [3, 3]),
++        ([98, 13], [T, T], [3, 3]),
++    ]
++    inputs = [_inputs(sum(q)) for _, q, _ in schedule]
++    # B's acceptances leave records pending (W = 3) when its prefill chunk
++    # (step 3) and C's fresh prefill on the same slot (step 5) arrive.
++    b_sampled = [4, 1, 1, 1, 1, 1, None, None]
++    sampled = []
++    for i, (_, ql, dr) in enumerate(schedule):
++        a = int(torch.randint(1, ql[0] + 1, (1,), generator=gen))
++        b = b_sampled[i]
++        if b is None:
++            b = int(torch.randint(1, ql[1] + 1, (1,), generator=gen))
++        sampled.append(torch.tensor([a, b], dtype=torch.int32))
++    results = {}
++    for window in (1, 3):
++        run = _Run(monkeypatch, "recover", window, 2, init, params)
++        outs = []
++        for i, (sl, ql, dr) in enumerate(schedule):
++            if window > 1 and i in (3, 5):
++                # B's slot (2) has pending records when the prefill reads it.
++                assert int(run.layer._replayssm_prev_num_accepted[2]) > 0
++            outs.append(run.step(sl, ql, dr, *inputs[i], sampled[i].to(DEV)))
++        conv = run.conv[run.table[:, 0].long()].clone()
++        results[window] = (outs, conv, run.final_states())
++    (o1, c1, s1), (o3, c3, s3) = results[1], results[3]
++    for i in range(len(schedule)):
++        _assert_same(o3[i], o1[i], f"output step {i}")
++    _assert_same(c3, c1, "conv state")
++    _assert_same(s3, s1, "final states")
+diff --git a/tests/kernels/mamba/test_gdn_recover_spec.py b/tests/kernels/mamba/test_gdn_recover_spec.py
+index 513bd2d83..f7ebfc947 100644
+--- a/tests/kernels/mamba/test_gdn_recover_spec.py
++++ b/tests/kernels/mamba/test_gdn_recover_spec.py
+@@ -164,7 +164,7 @@ def test_verify_commit_bitexact(N, t_max, ragged):
+     _assert_bitexact(state[1:], ref_state, "committed state")
+ 
+ 
+-@pytest.mark.parametrize("window", [1, 2, 3])
++@pytest.mark.parametrize("window", [1, 2, 3, 4])
+ def test_multistep_window(window):
+     """Several steps, with W > 1 keeping records pending across steps."""
+     N, t_max, steps = (3, 4, 5) if INTERPRET else (8, 4, 6)
+@@ -210,6 +210,52 @@ def test_multistep_window(window):
+         gdn_recover_reset_trackers(tr, slots)
+ 
+ 
++@pytest.mark.parametrize("window", [2, 4])
++def test_flush_at_finish_and_slot_reuse(window):
++    """W > 1: a request finishing (or preempted) with pending records is
++    force-folded (flush); a new request reusing the slot starts clean."""
++    N, t_max = 3, 4
++    gen = torch.Generator(device=DEV).manual_seed(40 + window)
++    A_log, dt_bias = _params(gen)
++    state, rec = _new_cache(N, gen, num_spec=t_max - 1, window=window)
++    slots = torch.arange(1, N + 1, dtype=torch.int32, device=DEV)
++    zeros = torch.zeros(state.shape[0], dtype=torch.int32, device=DEV)
++    tr = GDNRecoverTrackers(zeros.clone(), zeros.clone())
++    group = GDNRecoverCommitGroup(
++        [state], [rec], num_k_heads=H, window=window, trackers=tr
++    )
++
++    def step(s_ref, acc_list):
++        st = _Step([t_max] * N, gen)
++        o_ref, pool, idx = _reference(st, A_log, dt_bias, s_ref, t_max)
++        out = torch.empty((st.T, HV, V), device=DEV, dtype=torch.bfloat16)
++        gdn_recover_verify(
++            st.q, st.k, st.v, st.a, st.b, A_log, dt_bias,
++            state, rec, st.cu, slots, out=out, window=window, trackers=tr,
++        )  # fmt: skip
++        _assert_bitexact(out, o_ref, "verify output")
++        acc = torch.tensor(acc_list, dtype=torch.int32, device=DEV)
++        group.commit(slots, st.cu, acc)
++        return pool[idx[torch.arange(N), acc.long() - 1].long()]
++
++    s_ref = step(state[1:].clone(), [1, 2, 1])
++    assert int(tr.num_pending[1]) == 1  # request 0 has a pending record
++    # Request 0 finishes / is preempted: fold its pending records only.
++    group.flush(slots[:1])
++    assert int(tr.num_pending[1]) == 0
++    _assert_bitexact(state[1], s_ref[0], "flushed state")
++    # A new request takes slot 1 with a fresh (prefilled) state; the others
++    # keep their pending records.
++    fresh = torch.randn(state.shape[1:], generator=gen, device=DEV)
++    state[1] = fresh
++    s_ref = torch.cat([fresh[None], s_ref[1:]])
++    s_ref = step(s_ref, [2, 1, 1])
++    s_ref = step(s_ref, [4, 3, 2])
++    group.flush(slots)
++    assert int(tr.num_pending.abs().sum()) == 0
++    _assert_bitexact(state[1:], s_ref, "states after reuse and final flush")
++
++
+ def test_padding_and_null_slots():
+     """Slot <= 0 rows (FULL-graph padding): no output, records or state."""
+     N, t_max = 4, 4
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 1ee21d08f..e8bac8545 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -136,6 +136,7 @@ if TYPE_CHECKING:
+     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+     VLLM_GDN_SPEC_STATE: Literal["per_token", "recover"] = "per_token"
++    VLLM_GDN_SPEC_STATE_W: int = 1
+     VLLM_DISABLE_PYNCCL: bool = False
+     VLLM_USE_OINK_OPS: bool = False
+     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
+@@ -1320,6 +1321,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         ["per_token", "recover"],
+         case_sensitive=False,
+     ),
++    # VLLM_GDN_SPEC_STATE=recover commit window W: accepted records stay in the
++    # ring and are folded into the state once W tokens are pending (the verify
++    # replays them in registers); 1 folds every step.
++    "VLLM_GDN_SPEC_STATE_W": lambda: int(os.getenv("VLLM_GDN_SPEC_STATE_W", "1")),
+     # Disable pynccl (using torch.distributed instead)
+     "VLLM_DISABLE_PYNCCL": lambda: (
+         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 14fde4261..b6136eca4 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -48,6 +48,7 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weigh
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateShapeCalculator,
+     gdn_spec_recover_enabled,
++    gdn_spec_recover_window,
+     is_conv_state_dim_first,
+ )
+ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+@@ -59,6 +60,7 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+ )
+ from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
+     GDNRecoverRecords,
++    GDNRecoverTrackers,
+     gdn_recover_verify,
+ )
+ from vllm.model_executor.layers.mamba.ops.hip_gdn_chunk import (
+@@ -874,6 +876,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # VLLM_GDN_SPEC_STATE=recover: one state page per request, verify
+         # records + commit instead of per-draft-token states (Triton only).
+         self.spec_recover = gdn_spec_recover_enabled(self.num_spec)
++        # Commit window W > 1 keeps accepted records pending across steps; the
++        # per-slot ring trackers are shared by the layers of a cache group and
++        # bound with the KV cache (initialize_replayssm_ring_trackers).
++        self.recover_window = gdn_spec_recover_window() if self.spec_recover else 1
++        self.uses_gdn_recover_trackers = self.recover_window > 1
++        if self.uses_gdn_recover_trackers:
++            self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
++            self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
+         if self.spec_recover:
+             reason = self._spec_recover_unsupported_reason(vllm_config)
+             if reason is not None:
+@@ -1952,9 +1962,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             # The records verify reads q/k/v straight from the conv output.
+             query_spec = key_spec = value_spec = None
+         else:
+-            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+-                mixed_qkv_spec
+-            )
++            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+ 
+         # Split mixed non-spec-decode+prefill to process independently
+         split_non_spec = (
+@@ -2209,6 +2217,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 (1, num_tokens, num_v_heads, self.head_v_dim)
+             )
+         _, ssm_state, rec_u, rec_k, rec_g = self.kv_cache
++        window = getattr(self, "recover_window", 1)
++        trackers = None
++        if window > 1:
++            trackers = GDNRecoverTrackers(
++                self._replayssm_ring_start, self._replayssm_prev_num_accepted
++            )
+         gdn_recover_verify(
+             q.view(num_tokens, num_k_heads, self.head_k_dim),
+             k.view(num_tokens, num_k_heads, self.head_k_dim),
+@@ -2223,6 +2237,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             slot_indices=spec_state_indices[:, 0],
+             out=out[0],
+             scale=self.head_k_dim**-0.5,
++            window=window,
++            trackers=trackers,
+         )
+         return out
+ 
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 23bce19e9..7b8c8f425 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -64,6 +64,14 @@ def gdn_spec_recover_enabled(num_spec: int) -> bool:
+     return num_spec > 0 and envs.VLLM_GDN_SPEC_STATE.lower() == "recover"
+ 
+ 
++def gdn_spec_recover_window() -> int:
++    """Commit window W of VLLM_GDN_SPEC_STATE=recover (VLLM_GDN_SPEC_STATE_W)."""
++    window = envs.VLLM_GDN_SPEC_STATE_W
++    if not 1 <= window <= 64:
++        raise ValueError(f"VLLM_GDN_SPEC_STATE_W must be in [1, 64], got {window}")
++    return window
++
++
+ class MambaStateDtypeCalculator:
+     @classmethod
+     def linear_attention_state_dtype(
+@@ -324,6 +332,7 @@ class MambaStateShapeCalculator:
+                     head_k_dim,
+                     head_v_dim,
+                     num_spec,
++                    window=gdn_spec_recover_window(),
+                 ),
+             )
+         return conv_state_shape, temporal_state_shape
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index c25350df6..2b7bfef5c 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -803,6 +803,16 @@ class GDNRecoverCommitGroup:
+             num_stages=_NUM_STAGES,
+         )
+ 
++    def flush(self, slots: torch.Tensor) -> None:
++        """Force-fold every pending record of `slots` and reset their trackers
++        (e.g. before a prefill / non-spec row reads the state, at request
++        finish or preemption). A no-op for slots with nothing pending."""
++        n = slots.shape[0]
++        if n == 0:
++            return
++        zeros = torch.zeros(n + 1, dtype=torch.int32, device=slots.device)
++        self.commit(slots, zeros, zeros[:n], force=True)
++
+ 
+ def gdn_recover_reset_trackers(
+     trackers: GDNRecoverTrackers | None, slots: torch.Tensor
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 4c2cdbfcf..924b78c14 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -232,6 +232,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         # request (num_speculative_blocks == 0) and verify with records.
+         from vllm.model_executor.layers.mamba.mamba_utils import (
+             gdn_spec_recover_enabled,
++            gdn_spec_recover_window,
+         )
+ 
+         self.spec_recover = (
+@@ -240,6 +241,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             and kv_cache_spec.num_speculative_blocks == 0
+         )
+         self._spec_state_cols = 1 if self.spec_recover else self.num_spec + 1
++        self._recover_window = gdn_spec_recover_window() if self.spec_recover else 1
+         self._recover_group = None
+         self._recover_group_key: tuple[int, ...] | None = None
+ 
+@@ -752,6 +754,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                         device=query_start_loc.device,
+                         dtype=torch.int32,
+                     )
++        if num_prefills > 0 or num_decodes > 0:
++            self._recover_flush(non_spec_state_indices_tensor)
+         attn_metadata = metadata_cls(
+             **recover_kwargs,
+             num_prefills=num_prefills,
+@@ -865,6 +869,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+ 
+         recover_kwargs = {}
+         if isinstance(m, GDNRecoverSpecMetadata):
++            if m.num_prefills > 0 or m.num_decodes > 0:
++                self._recover_flush(non_spec_indices)
+             # The commit folds into this group's layers and slots.
+             recover_kwargs["recover_builder"] = self
+             recover_kwargs["recover_slot_indices"] = (
+@@ -887,26 +893,63 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
+             GDNRecoverCommitGroup,
+             GDNRecoverRecords,
++            GDNRecoverTrackers,
+         )
+ 
+         ctx = self.vllm_config.compilation_config.static_forward_context
+         layers = [ctx[name] for name in self.layer_names]
++        window = self._recover_window
+         key = tuple(layer.kv_cache[1].data_ptr() for layer in layers)
++        if window > 1:
++            key += (layers[0]._replayssm_ring_start.data_ptr(),)
+         if self._recover_group is None or key != self._recover_group_key:
++            trackers = None
+             for layer in layers:
+                 if not getattr(layer, "spec_recover", False):
+                     raise RuntimeError(
+                         f"{type(layer).__name__} does not support "
+                         "VLLM_GDN_SPEC_STATE=recover"
+                     )
++                if getattr(layer, "recover_window", 1) != window:
++                    raise RuntimeError("GDN recover window differs between layers")
++            if window > 1:
++                # One tracker pair per cache group, shared by its layers.
++                trackers = GDNRecoverTrackers(
++                    layers[0]._replayssm_ring_start,
++                    layers[0]._replayssm_prev_num_accepted,
++                )
++                assert all(
++                    layer._replayssm_ring_start is trackers.ring_start
++                    and layer._replayssm_prev_num_accepted is trackers.num_pending
++                    for layer in layers
++                ), "GDN recover layers of a group must share ring trackers"
+             self._recover_group = GDNRecoverCommitGroup(
+                 states=[layer.kv_cache[1] for layer in layers],
+                 records=[GDNRecoverRecords(*layer.kv_cache[2:5]) for layer in layers],
+                 num_k_heads=layers[0].num_k_heads // layers[0].tp_size,
++                window=window,
++                trackers=trackers,
+             )
+             self._recover_group_key = key
+         return self._recover_group
+ 
++    def _recover_flush(self, slots: torch.Tensor | None) -> None:
++        """Fold the pending records of slots read outside the spec verify
++        (prefill / non-spec decode rows) and reset their ring trackers.
++
++        Only with a commit window W > 1: with W = 1 nothing is ever pending. A
++        fresh request's slot may still carry its previous owner's trackers;
++        folding those into a state the prefill overwrites is harmless."""
++        if (
++            not self.spec_recover
++            or self._recover_window == 1
++            or slots is None
++            or slots.numel() == 0
++            or slots.device.type != "cuda"
++        ):
++            return
++        self.recover_commit_group().flush(slots)
++
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+     ):
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index e26b026df..6925c1fdd 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -12,6 +12,7 @@ from vllm.config.compilation import CUDAGraphMode
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFuncsByType,
+     gdn_spec_recover_enabled,
++    gdn_spec_recover_window,
+ )
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import async_tensor_h2d
+@@ -162,7 +163,10 @@ class MambaHybridModelState(DefaultModelState):
+     def initialize_kv_cache(
+         self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
+     ) -> None:
+-        if self.cache_config.use_replayssm:
++        if self.cache_config.use_replayssm or (
++            gdn_spec_recover_enabled(self.vllm_config.num_speculative_tokens)
++            and gdn_spec_recover_window() > 1
++        ):
+             initialize_replayssm_ring_trackers(
+                 kv_cache_config,
+                 self.vllm_config.compilation_config.static_forward_context,
+diff --git a/vllm/v1/worker/replayssm_utils.py b/vllm/v1/worker/replayssm_utils.py
+index e587d12ef..0b1f16efa 100644
+--- a/vllm/v1/worker/replayssm_utils.py
++++ b/vllm/v1/worker/replayssm_utils.py
+@@ -28,7 +28,11 @@ def initialize_replayssm_ring_trackers(
+             name
+             for name in group.layer_names
+             if isinstance(layer := forward_context.get(name), MambaBase)
+-            and layer.use_replayssm
++            and (
++                layer.use_replayssm
++                # GDN spec "recover" with commit window W > 1.
++                or getattr(layer, "uses_gdn_recover_trackers", False)
++            )
+         ]
+         if not names:
+             continue

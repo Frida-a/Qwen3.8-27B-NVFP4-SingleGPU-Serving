@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:48:38 -0800
+Subject: [PATCH] [GDN] recover spec: cheaper verify checks, finite-input
+ guards in tests
+
+- gdn_recover_verify checks per-slot record contiguity from strides instead
+  of indexing (it runs eagerly per layer for mixed prefill+spec batches).
+- Bit-exact asserts require a finite reference (NaN payloads could compare
+  equal); the model-path test checks its outputs and states are finite.
+- Recover metadata tests pin mamba_cache_mode "none".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/mamba/test_gdn_recover_model_path.py   |  2 ++
+ tests/kernels/mamba/test_gdn_recover_spec.py         |  2 ++
+ tests/v1/attention/test_gdn_recover_metadata.py      | 11 ++++++++++-
+ .../layers/mamba/ops/gdn_recover_spec.py             | 12 +++++++++++-
+ 4 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_model_path.py b/tests/kernels/mamba/test_gdn_recover_model_path.py
+index 4c5570c35..0b740d6aa 100644
+--- a/tests/kernels/mamba/test_gdn_recover_model_path.py
++++ b/tests/kernels/mamba/test_gdn_recover_model_path.py
+@@ -203,6 +203,8 @@ def test_recover_matches_per_token_path(monkeypatch, num_reqs):
+         results[recover] = (outs, conv[table[:, 0].long()].clone(), final.clone())
+ 
+     (o0, c0, s0), (o1, c1, s1) = results[False], results[True]
++    assert all(torch.isfinite(o.float()).all() for o in o0)
++    assert torch.isfinite(s0).all()
+     for s in range(steps):
+         assert torch.equal(_bits(o1[s]), _bits(o0[s])), f"output step {s}"
+     assert torch.equal(_bits(c1), _bits(c0)), "conv state"
+diff --git a/tests/kernels/mamba/test_gdn_recover_spec.py b/tests/kernels/mamba/test_gdn_recover_spec.py
+index 2e0ed31e7..513bd2d83 100644
+--- a/tests/kernels/mamba/test_gdn_recover_spec.py
++++ b/tests/kernels/mamba/test_gdn_recover_spec.py
+@@ -45,6 +45,8 @@ def _bits(x: torch.Tensor) -> torch.Tensor:
+ 
+ def _assert_bitexact(got: torch.Tensor, ref: torch.Tensor, what: str) -> None:
+     assert got.shape == ref.shape and got.dtype == ref.dtype, what
++    # NaN payloads could compare equal bitwise; keep the test meaningful.
++    assert torch.isfinite(ref.float()).all(), f"{what}: non-finite reference"
+     if not torch.equal(_bits(got), _bits(ref)):
+         diff = (got.float() - ref.float()).abs()
+         n_bad = int((_bits(got) != _bits(ref)).sum())
+diff --git a/tests/v1/attention/test_gdn_recover_metadata.py b/tests/v1/attention/test_gdn_recover_metadata.py
+index ccd7b67ea..e94ff0e6d 100644
+--- a/tests/v1/attention/test_gdn_recover_metadata.py
++++ b/tests/v1/attention/test_gdn_recover_metadata.py
+@@ -9,7 +9,9 @@ import torch
+ 
+ from tests.v1.attention.test_gdn_metadata_builder import (
+     _build,
+-    _create_gdn_builder,
++)
++from tests.v1.attention.test_gdn_metadata_builder import (
++    _create_gdn_builder as _create_builder,
+ )
+ from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+ from vllm.v1.attention.backends.gdn_attn import (
+@@ -22,6 +24,13 @@ DEVICE = torch.device("cpu")
+ NUM_SPEC = 3
+ 
+ 
++def _create_gdn_builder(*args, **kwargs):
++    # Recover mode supports mamba_cache_mode "none" only (one slot per request).
++    builder = _create_builder(*args, **kwargs)
++    builder.vllm_config.cache_config.mamba_cache_mode = "none"
++    return builder
++
++
+ @pytest.fixture
+ def recover_env(monkeypatch):
+     monkeypatch.setenv("VLLM_GDN_SPEC_STATE", "recover")
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index b2cd03e9b..c25350df6 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -346,6 +346,16 @@ class GDNRecoverTrackers:
+     num_pending: torch.Tensor  # [num_slots] int32
+ 
+ 
++def _slot_contiguous(x: torch.Tensor) -> bool:
++    """Each slot x[i] is contiguous (slots may be strided, e.g. page views)."""
++    expected = 1
++    for size, stride in zip(reversed(x.shape[1:]), reversed(x.stride()[1:])):
++        if size != 1 and stride != expected:
++            return False
++        expected *= size
++    return True
++
++
+ def _check_head_contiguous(name: str, x: torch.Tensor) -> None:
+     if x.stride(-1) != 1 or (x.dim() >= 2 and x.stride(-2) != x.shape[-1]):
+         raise ValueError(f"GDN recover verify: {name} heads must be contiguous")
+@@ -398,7 +408,7 @@ def gdn_recover_verify(
+         raise ValueError("GDN recover verify: key record dtype must match k")
+     R = records.ring_len
+     for name, x in (("u", records.u), ("k", records.k), ("g", records.g)):
+-        if not x[0].is_contiguous():
++        if not _slot_contiguous(x):
+             raise ValueError(f"GDN recover verify: {name} records must be contiguous")
+     if window > 1 and trackers is None:
+         raise ValueError("GDN recover verify: window > 1 needs ring trackers")

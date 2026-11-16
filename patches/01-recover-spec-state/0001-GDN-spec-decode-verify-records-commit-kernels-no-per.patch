@@ -1,0 +1,1478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:11:26 -0800
+Subject: [PATCH] [GDN] spec-decode verify records + commit kernels (no
+ per-draft state writes)
+
+Triton kernels for GDN speculative decoding that keep one recurrent state per
+request instead of one per draft position:
+
+- gdn_recover_verify: runs the same per-token recurrence as
+  fused_sigmoid_gating_delta_rule_update (same code and tiling, state in
+  registers) but, instead of storing the fp32 state after every token, writes
+  per-token records (u = beta (v - S k) fp32 [HV, V], raw k act-dtype [H, K],
+  g fp32 [HV]) into a ring in the request's Mamba slot.
+- GDNRecoverCommitGroup.commit: after sampling, folds the accepted records
+  into the checkpoint state in forward order (fma(u, k, S * exp(g)), the
+  contraction the verify uses) for all layers of a cache group in one launch.
+  Hooks: per-request dst slot and block-boundary state (align mode), row
+  indices into the batch's num_sampled, window W > 1 with ring trackers
+  (records stay pending across steps), forced folds.
+- State codec dispatch points gdn_spec_load_state / gdn_spec_store_state on a
+  constexpr FMT (fp32 implemented; bf16/int16_row/int8_row/int8_had32
+  reserved) with per-head padded rows VP.
+
+Tests compare outputs and committed states bit-exactly against the Triton
+per-token reference (K+1 = 4, 8; batch 1/4/32; ragged; W = 1/2/3) and report
+the difference to the CUDA fused MTP kernel. Benchmark script included.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/kernels/bench_gdn_recover_spec.py  | 226 +++++
+ tests/kernels/mamba/test_gdn_recover_spec.py  | 391 +++++++++
+ .../layers/mamba/ops/gdn_recover_spec.py      | 805 ++++++++++++++++++
+ 3 files changed, 1422 insertions(+)
+ create mode 100644 benchmarks/kernels/bench_gdn_recover_spec.py
+ create mode 100644 tests/kernels/mamba/test_gdn_recover_spec.py
+ create mode 100644 vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+
+diff --git a/benchmarks/kernels/bench_gdn_recover_spec.py b/benchmarks/kernels/bench_gdn_recover_spec.py
+new file mode 100644
+index 000000000..fb8763e08
+--- /dev/null
++++ b/benchmarks/kernels/bench_gdn_recover_spec.py
+@@ -0,0 +1,226 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN spec-decode verify: records + commit vs per-token state writes.
++
++Per layer (Qwen3.8-27B GDN, TP1: H=16, HV=48, K=V=128, fp32 state), every
++request verifying T = num_spec + 1 tokens:
++  triton  fused_sigmoid_gating_delta_rule_update, 2-D slots (T state writes)
++  cuda    fused_gdn_decode_post_conv_mtp (T state writes, gated RMSNorm fused)
++  b4      gdn_recover_verify + gated RMSNorm (separate) + commit
++          (commit timed per layer and amortized over a 16-layer group launch)
++Timings are CUDA-graph replays that rotate over disjoint state slots, so the
++states come from HBM (not L2) as in the 48-layer model.
++
++usage: python benchmarks/kernels/bench_gdn_recover_spec.py [--out res.json]
++"""
++
++import argparse
++import json
++
++import torch
++
++from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++    GDNRecoverCommitGroup,
++    GDNRecoverRecords,
++    gdn_recover_verify,
++)
++from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
++    fused_sigmoid_gating_delta_rule_update,
++)
++from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
++    layer_norm_fwd,
++)
++
++H, HV, K, V = 16, 48, 128, 128
++STATE_BYTES = HV * V * K * 4
++DEV = "cuda"
++MIN_ROTATION_BYTES = 768 << 20  # > L2
++
++
++def graph_time_us(fns, iters=20):
++    """Mean GPU time (us) of one fn call, replaying all fns in one graph."""
++    for f in fns:
++        f()
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    s = torch.cuda.Stream()
++    with torch.cuda.stream(s), torch.cuda.graph(g):
++        for f in fns:
++            f()
++    torch.cuda.synchronize()
++    g.replay()
++    torch.cuda.synchronize()
++    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
++    start.record()
++    for _ in range(iters):
++        g.replay()
++    end.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(end) * 1e3 / (iters * len(fns))
++
++
++def make_inputs(N, T, gen):
++    tok = N * T
++    conv_dim = 2 * H * K + HV * V
++    mixed_qkv = (torch.randn((tok, conv_dim), generator=gen, device=DEV) * 0.5).to(
++        torch.bfloat16
++    )
++    ba = torch.randn((tok, 2 * HV), generator=gen, device=DEV).to(torch.bfloat16)
++    gate = torch.randn((tok, HV, V), generator=gen, device=DEV).to(torch.bfloat16)
++    A_log = torch.log(torch.rand(HV, generator=gen, device=DEV) * 15 + 1)
++    dt_bias = torch.randn(HV, generator=gen, device=DEV)
++    cu = torch.arange(0, tok + 1, T, dtype=torch.int32, device=DEV)
++    return mixed_qkv, ba, gate, A_log, dt_bias, cu
++
++
++def bytes_model(N, T, n_acc):
++    """HBM bytes per layer per step (state + records; activations excluded)."""
++    rec_tok = HV * V * 4 + H * K * 2 + HV * 4  # u fp32, k bf16, g fp32
++    per_token = N * T * STATE_BYTES
++    return {
++        "per_token_writes": N * STATE_BYTES + per_token,  # read S0 + T writes
++        "b4_verify": N * (STATE_BYTES + T * rec_tok),
++        "b4_commit": N * (2 * STATE_BYTES + n_acc * rec_tok),
++    }
++
++
++def bench(N, T, rows, gen):
++    mixed_qkv, ba, gate, A_log, dt_bias, cu = make_inputs(N, T, gen)
++    tok = N * T
++    b, a = ba[:, :HV], ba[:, HV:]
++    q = mixed_qkv[:, : H * K].view(tok, H, K)
++    k = mixed_qkv[:, H * K : 2 * H * K].view(tok, H, K)
++    v = mixed_qkv[:, 2 * H * K :].view(tok, HV, V)
++    norm_w = torch.ones(V, dtype=torch.bfloat16, device=DEV)
++    acc = torch.full((N,), max(1, (T + 1) // 2), dtype=torch.int32, device=DEV)
++    res = {"N": N, "T": T}
++
++    # --- baseline Triton (per-token state slots) ---
++    rot = max(1, -(-MIN_ROTATION_BYTES // (N * T * STATE_BYTES)))
++    pool = torch.zeros((1 + rot * N * T, HV, V, K), device=DEV)
++    idxs = [
++        (1 + r * N * T + torch.arange(N * T, device=DEV, dtype=torch.int32)).view(N, T)
++        for r in range(rot)
++    ]
++    ones = torch.ones(N, dtype=torch.int32, device=DEV)
++    q4, k4, v4 = (x.contiguous().unsqueeze(0) for x in (q, k, v))
++    a3, b3 = a.contiguous().unsqueeze(0), b.contiguous().unsqueeze(0)
++
++    def tri(idx):
++        return lambda: fused_sigmoid_gating_delta_rule_update(
++            A_log=A_log, a=a3, b=b3, dt_bias=dt_bias, q=q4, k=k4, v=v4,
++            initial_state=pool, inplace_final_state=True, cu_seqlens=cu,
++            ssm_state_indices=idx, num_accepted_tokens=ones,
++            use_qk_l2norm_in_kernel=True,
++        )  # fmt: skip
++
++    res["triton_us"] = graph_time_us([tri(i) for i in idxs])
++
++    out = torch.empty((tok, HV, V), dtype=torch.bfloat16, device=DEV)
++
++    def norm():
++        layer_norm_fwd(
++            out.view(-1, V), norm_w, None, 1e-6, z=gate.view(-1, V),
++            out=out.view(-1, V), group_size=V, norm_before_gate=True,
++            is_rms_norm=True, activation="silu",
++        )  # fmt: skip
++
++    res["rmsnorm_us"] = graph_time_us([norm])
++
++    # --- CUDA fused (per-token state slots, norm fused) ---
++    if hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp"):
++        from vllm import _custom_ops as ops
++
++        a_c, b_c = a.contiguous(), b.contiguous()
++
++        def cud(idx):
++            return lambda: ops.fused_gdn_decode_post_conv_mtp(
++                mixed_qkv=mixed_qkv, a=a_c, b=b_c, A_log=A_log, dt_bias=dt_bias,
++                state_indices=idx, cu_seqlens=cu, num_accepted_tokens=ones,
++                state=pool, output_gate=gate, norm_weight=norm_w, out=out,
++                scale=K**-0.5, norm_eps=1e-6, output_gate_activation="silu",
++            )  # fmt: skip
++
++        res["cuda_us"] = graph_time_us([cud(i) for i in idxs])
++
++    # --- B4: verify (+norm) and commit, one slot per request ---
++    rot = max(1, -(-MIN_ROTATION_BYTES // (N * STATE_BYTES)))
++    n_slots = 1 + rot * N
++    state = torch.zeros((n_slots, HV, V, K), device=DEV)
++    rec = GDNRecoverRecords.allocate(
++        n_slots, H, HV, K, V, T - 1, torch.bfloat16, DEV, window=1
++    )
++    slot_sets = [
++        1 + r * N + torch.arange(N, device=DEV, dtype=torch.int32) for r in range(rot)
++    ]
++
++    def ver(slots):
++        return lambda: gdn_recover_verify(
++            q, k, v, a, b, A_log, dt_bias, state, rec, cu, slots, out=out
++        )
++
++    res["b4_verify_us"] = graph_time_us([ver(s) for s in slot_sets])
++    group1 = GDNRecoverCommitGroup([state], [rec], num_k_heads=H)
++
++    def com(group, slots):
++        return lambda: group.commit(slots, cu, acc)
++
++    res["b4_commit_us"] = graph_time_us([com(group1, s) for s in slot_sets])
++    # One launch for a whole cache group (16 GDN layers in Qwen3.8), each
++    # layer with its own buffers; rotate slots so the group misses L2.
++    rot16 = max(1, -(-MIN_ROTATION_BYTES // (rows * N * STATE_BYTES)))
++    n16 = 1 + rot16 * N
++    states = [torch.zeros((n16, HV, V, K), device=DEV) for _ in range(rows)]
++    recs = [
++        GDNRecoverRecords.allocate(n16, H, HV, K, V, T - 1, torch.bfloat16, DEV)
++        for _ in range(rows)
++    ]
++    group16 = GDNRecoverCommitGroup(states, recs, num_k_heads=H)
++    res[f"b4_commit_x{rows}_per_layer_us"] = (
++        graph_time_us([com(group16, s) for s in slot_sets[:rot16]]) / rows
++    )
++    res["b4_total_us"] = (
++        res["b4_verify_us"] + res["rmsnorm_us"] + res[f"b4_commit_x{rows}_per_layer_us"]
++    )
++    res["triton_plus_norm_us"] = res["triton_us"] + res["rmsnorm_us"]
++    res["bytes"] = bytes_model(N, T, int(acc[0]))
++    torch.cuda.empty_cache()
++    return res
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--batch", type=int, nargs="+", default=[1, 16, 64])
++    p.add_argument("--tokens", type=int, nargs="+", default=[4, 8])
++    p.add_argument("--group-layers", type=int, default=16)
++    p.add_argument("--out", default=None)
++    args = p.parse_args()
++    gen = torch.Generator(device=DEV).manual_seed(0)
++    results = []
++    hdr = (
++        f"{'N':>4} {'T':>2} | {'triton':>8} {'+norm':>8} {'cuda':>8} | "
++        f"{'verify':>8} {'norm':>7} {'commit':>8} {'commit/L':>8} {'b4 tot':>8} | "
++        f"{'MiB pt':>7} {'MiB b4':>7}"
++    )
++    print(hdr)
++    for T in args.tokens:
++        for N in args.batch:
++            r = bench(N, T, args.group_layers, gen)
++            results.append(r)
++            bm = r["bytes"]
++            cl = r[f"b4_commit_x{args.group_layers}_per_layer_us"]
++            print(
++                f"{N:>4} {T:>2} | {r['triton_us']:8.1f} {r['triton_plus_norm_us']:8.1f} "
++                f"{r.get('cuda_us', float('nan')):8.1f} | {r['b4_verify_us']:8.1f} "
++                f"{r['rmsnorm_us']:7.1f} {r['b4_commit_us']:8.1f} {cl:8.1f} "
++                f"{r['b4_total_us']:8.1f} | {bm['per_token_writes'] / 2**20:7.1f} "
++                f"{(bm['b4_verify'] + bm['b4_commit']) / 2**20:7.1f}",
++                flush=True,
++            )
++    if args.out:
++        with open(args.out, "w") as f:
++            json.dump(results, f, indent=1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/mamba/test_gdn_recover_spec.py b/tests/kernels/mamba/test_gdn_recover_spec.py
+new file mode 100644
+index 000000000..2e0ed31e7
+--- /dev/null
++++ b/tests/kernels/mamba/test_gdn_recover_spec.py
+@@ -0,0 +1,391 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN spec-decode verify-records + commit (no per-draft-token state writes).
++
++Reference ("same-path baseline"): fused_sigmoid_gating_delta_rule_update with
++2-D ssm_state_indices / num_accepted_tokens, i.e. the Triton spec-decode path
++that stores the full state after every verified token. The records path must
++reproduce its outputs and the accepted state bit-exactly (fp32 state).
++
++Set GDN_RECOVER_DIFF_JSON=<path> to dump the diff against the CUDA
++fused_gdn_decode_post_conv_mtp kernel (not required to be exact).
++"""
++
++import json
++import os
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
++    GDNRecoverCommitGroup,
++    GDNRecoverRecords,
++    GDNRecoverTrackers,
++    gdn_recover_reset_trackers,
++    gdn_recover_verify,
++)
++from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
++    fused_sigmoid_gating_delta_rule_update,
++)
++
++INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
++DEV = "cpu" if INTERPRET else "cuda"
++if not INTERPRET and not torch.cuda.is_available():
++    pytest.skip("GDN recover spec kernels need CUDA", allow_module_level=True)
++
++K = V = 128
++# Qwen3.8-27B GDN heads (TP1); the interpreter run uses fewer v-heads.
++H = 16 if not INTERPRET else 2
++HV = 48 if not INTERPRET else 6
++
++
++def _bits(x: torch.Tensor) -> torch.Tensor:
++    return x.view({4: torch.int32, 2: torch.int16}[x.element_size()])
++
++
++def _assert_bitexact(got: torch.Tensor, ref: torch.Tensor, what: str) -> None:
++    assert got.shape == ref.shape and got.dtype == ref.dtype, what
++    if not torch.equal(_bits(got), _bits(ref)):
++        diff = (got.float() - ref.float()).abs()
++        n_bad = int((_bits(got) != _bits(ref)).sum())
++        raise AssertionError(
++            f"{what}: {n_bad}/{got.numel()} elements differ, "
++            f"max abs diff {diff.max().item():.3e}"
++        )
++
++
++class _Step:
++    """Random post-conv inputs of one spec-decode step (N requests)."""
++
++    def __init__(self, qlens: list[int], gen: torch.Generator, num_v_heads=HV):
++        self.qlens = qlens
++        self.N = len(qlens)
++        self.T = sum(qlens)
++        hv = num_v_heads
++        self.hv = hv
++        conv_dim = 2 * H * K + hv * V
++        # Post-conv SiLU activations; v larger than q/k as in the model.
++        self.mixed_qkv = (
++            torch.randn((self.T, conv_dim), generator=gen, device=DEV) * 0.5
++        ).to(torch.bfloat16)
++        self.mixed_qkv[:, 2 * H * K :] *= 4
++        qkv = self.mixed_qkv
++        self.q = qkv[:, : H * K].view(self.T, H, K)
++        self.k = qkv[:, H * K : 2 * H * K].view(self.T, H, K)
++        self.v = qkv[:, 2 * H * K :].view(self.T, hv, V)
++        ba = torch.randn((self.T, 2 * hv), generator=gen, device=DEV).to(torch.bfloat16)
++        self.b, self.a = ba[:, :hv], ba[:, hv:]  # strided views, as split_ba
++        self.cu = torch.zeros(self.N + 1, dtype=torch.int32, device=DEV)
++        self.cu[1:] = torch.cumsum(torch.tensor(qlens, device=DEV), 0)
++
++
++def _params(gen, num_v_heads=HV):
++    A_log = torch.log(torch.rand(num_v_heads, generator=gen, device=DEV) * 15 + 1)
++    dt_bias = torch.randn(num_v_heads, generator=gen, device=DEV)
++    return A_log, dt_bias
++
++
++def _reference(step: _Step, A_log, dt_bias, s0: torch.Tensor, t_max: int):
++    """Baseline Triton path: per-token states in [N, t_max] slots."""
++    N = step.N
++    pool = torch.zeros((1 + N * t_max, step.hv, V, K), device=DEV)
++    idx = torch.arange(1, 1 + N * t_max, device=DEV, dtype=torch.int32).view(N, t_max)
++    pool[idx[:, 0].long()] = s0
++    acc = torch.ones(N, dtype=torch.int32, device=DEV)
++    o, _ = fused_sigmoid_gating_delta_rule_update(
++        A_log=A_log,
++        a=step.a.unsqueeze(0),
++        b=step.b.unsqueeze(0),
++        dt_bias=dt_bias,
++        q=step.q.unsqueeze(0),
++        k=step.k.unsqueeze(0),
++        v=step.v.unsqueeze(0),
++        initial_state=pool,
++        inplace_final_state=True,
++        cu_seqlens=step.cu,
++        ssm_state_indices=idx,
++        num_accepted_tokens=acc,
++        use_qk_l2norm_in_kernel=True,
++    )
++    return o.squeeze(0), pool, idx
++
++
++def _new_cache(N, gen, num_spec, window=1, num_v_heads=HV, extra_slots=0):
++    num_slots = 1 + N + extra_slots
++    state = torch.randn((num_slots, num_v_heads, V, K), generator=gen, device=DEV)
++    rec = GDNRecoverRecords.allocate(
++        num_slots, H, num_v_heads, K, V, num_spec, torch.bfloat16, DEV, window
++    )
++    return state, rec
++
++
++def _rand_qlens(N, t_max, gen, ragged):
++    if not ragged:
++        return [t_max] * N
++    return torch.randint(1, t_max + 1, (N,), generator=gen).tolist()
++
++
++@pytest.mark.parametrize("t_max", [4, 8])
++@pytest.mark.parametrize("N", [1, 4, 32])
++@pytest.mark.parametrize("ragged", [False, True])
++def test_verify_commit_bitexact(N, t_max, ragged):
++    if INTERPRET and N > 4:
++        pytest.skip("slow under the interpreter")
++    gen = torch.Generator(device=DEV).manual_seed(1000 * N + t_max + ragged)
++    cpu_gen = torch.Generator().manual_seed(N + t_max)
++    qlens = _rand_qlens(N, t_max, cpu_gen, ragged)
++    step = _Step(qlens, gen)
++    A_log, dt_bias = _params(gen)
++    state, rec = _new_cache(N, gen, num_spec=t_max - 1)
++    slots = torch.arange(1, N + 1, dtype=torch.int32, device=DEV)
++    s0 = state[1:].clone()
++
++    o_ref, pool, idx = _reference(step, A_log, dt_bias, s0, t_max)
++
++    out = torch.full((step.T, HV, V), float("nan"), device=DEV, dtype=torch.bfloat16)
++    gdn_recover_verify(
++        step.q, step.k, step.v, step.a, step.b, A_log, dt_bias,
++        state, rec, step.cu, slots, out=out,
++    )  # fmt: skip
++    _assert_bitexact(out, o_ref, "verify output")
++    _assert_bitexact(state[1:], s0, "checkpoint untouched by verify")
++
++    acc = torch.tensor(
++        [int(torch.randint(1, q + 1, (1,), generator=cpu_gen)) for q in qlens],
++        dtype=torch.int32,
++        device=DEV,
++    )
++    acc[0] = qlens[0]  # always cover full acceptance
++    group = GDNRecoverCommitGroup([state], [rec], num_k_heads=H)
++    group.commit(slots, step.cu, acc)
++    ref_state = pool[idx[torch.arange(N), acc.long() - 1].long()]
++    _assert_bitexact(state[1:], ref_state, "committed state")
++
++
++@pytest.mark.parametrize("window", [1, 2, 3])
++def test_multistep_window(window):
++    """Several steps, with W > 1 keeping records pending across steps."""
++    N, t_max, steps = (3, 4, 5) if INTERPRET else (8, 4, 6)
++    gen = torch.Generator(device=DEV).manual_seed(7 + window)
++    cpu_gen = torch.Generator().manual_seed(window)
++    A_log, dt_bias = _params(gen)
++    state, rec = _new_cache(N, gen, num_spec=t_max - 1, window=window)
++    slots = torch.arange(1, N + 1, dtype=torch.int32, device=DEV)
++    tr = None
++    if window > 1:
++        tr = GDNRecoverTrackers(
++            torch.zeros(state.shape[0], dtype=torch.int32, device=DEV),
++            torch.zeros(state.shape[0], dtype=torch.int32, device=DEV),
++        )
++    group = GDNRecoverCommitGroup(
++        [state], [rec], num_k_heads=H, window=window, trackers=tr
++    )
++    s_ref = state[1:].clone()
++    for _ in range(steps):
++        qlens = _rand_qlens(N, t_max, cpu_gen, ragged=True)
++        step = _Step(qlens, gen)
++        o_ref, pool, idx = _reference(step, A_log, dt_bias, s_ref, t_max)
++        out = torch.empty((step.T, HV, V), device=DEV, dtype=torch.bfloat16)
++        gdn_recover_verify(
++            step.q, step.k, step.v, step.a, step.b, A_log, dt_bias,
++            state, rec, step.cu, slots, out=out, window=window, trackers=tr,
++        )  # fmt: skip
++        _assert_bitexact(out, o_ref, f"verify output (W={window})")
++        acc = torch.tensor(
++            [int(torch.randint(1, q + 1, (1,), generator=cpu_gen)) for q in qlens],
++            dtype=torch.int32,
++            device=DEV,
++        )
++        group.commit(slots, step.cu, acc)
++        s_ref = pool[idx[torch.arange(N), acc.long() - 1].long()]
++    # Fold what is still pending (finish / preemption) without a new step.
++    empty_cu = torch.zeros(N + 1, dtype=torch.int32, device=DEV)
++    group.commit(slots, empty_cu, torch.ones(N, dtype=torch.int32, device=DEV),
++                 force=True)  # fmt: skip
++    _assert_bitexact(state[1:], s_ref, f"state after forced fold (W={window})")
++    if tr is not None:
++        assert int(tr.num_pending.abs().sum()) == 0
++        gdn_recover_reset_trackers(tr, slots)
++
++
++def test_padding_and_null_slots():
++    """Slot <= 0 rows (FULL-graph padding): no output, records or state."""
++    N, t_max = 4, 4
++    gen = torch.Generator(device=DEV).manual_seed(3)
++    step = _Step([t_max] * N, gen)
++    A_log, dt_bias = _params(gen)
++    state, rec = _new_cache(N, gen, num_spec=t_max - 1)
++    slots = torch.tensor([1, 0, 3, -1], dtype=torch.int32, device=DEV)
++    before = state.clone()
++    rec_before = [x.clone() for x in (rec.u, rec.k, rec.g)]
++    out = torch.full((step.T, HV, V), 7.0, device=DEV, dtype=torch.bfloat16)
++    gdn_recover_verify(
++        step.q, step.k, step.v, step.a, step.b, A_log, dt_bias,
++        state, rec, step.cu, slots, out=out,
++    )  # fmt: skip
++    for n in (1, 3):
++        assert torch.all(out[n * t_max : (n + 1) * t_max] == 7.0)
++    # The null block's records stay untouched.
++    for x, x0 in zip((rec.u, rec.k, rec.g), rec_before):
++        _assert_bitexact(x[0], x0[0], "null-slot records")
++    GDNRecoverCommitGroup([state], [rec], num_k_heads=H).commit(
++        slots, step.cu, torch.full((N,), t_max, dtype=torch.int32, device=DEV)
++    )
++    for s in (0, 2, 4):
++        _assert_bitexact(state[s], before[s], f"slot {s}")
++
++
++def test_dst_and_boundary_slots():
++    """Align-mode hooks: commit to another slot, and materialize the state
++    after a block boundary inside the accepted tokens."""
++    N, t_max = 3, 8
++    gen = torch.Generator(device=DEV).manual_seed(5)
++    step = _Step([t_max] * N, gen)
++    A_log, dt_bias = _params(gen)
++    state, rec = _new_cache(N, gen, num_spec=t_max - 1, extra_slots=2 * N)
++    slots = torch.arange(1, N + 1, dtype=torch.int32, device=DEV)
++    s0 = state[1 : N + 1].clone()
++    o_ref, pool, idx = _reference(step, A_log, dt_bias, s0, t_max)
++    gdn_recover_verify(
++        step.q, step.k, step.v, step.a, step.b, A_log, dt_bias,
++        state, rec, step.cu, slots,
++    )  # fmt: skip
++    acc = torch.tensor([8, 5, 3], dtype=torch.int32, device=DEV)
++    b_lens = torch.tensor([2, 5, 4], dtype=torch.int32, device=DEV)  # 4 > acc
++    dst = slots + N
++    bnd = slots + 2 * N
++    before = state.clone()
++    GDNRecoverCommitGroup([state], [rec], num_k_heads=H).commit(
++        slots, step.cu, acc, dst_slots=dst, boundary_slots=bnd, boundary_lens=b_lens
++    )
++    _assert_bitexact(state[1 : N + 1], s0, "source slot kept")
++    rows = torch.arange(N)
++    _assert_bitexact(
++        state[dst.long()], pool[idx[rows, acc.long() - 1].long()], "dst state"
++    )
++    for n in range(N):
++        if b_lens[n] <= acc[n]:
++            ref_b = pool[idx[n, b_lens[n].item() - 1].long()]
++        else:
++            ref_b = before[bnd[n].item()]
++        _assert_bitexact(state[bnd[n].item()], ref_b, f"boundary state row {n}")
++
++
++def test_multilayer_commit_and_row_indices():
++    """One launch commits several layers; spec rows map to batch rows."""
++    N, t_max, L = 4, 4, 3
++    gen = torch.Generator(device=DEV).manual_seed(11)
++    cpu_gen = torch.Generator().manual_seed(11)
++    A_log, dt_bias = _params(gen)
++    slots = torch.arange(1, N + 1, dtype=torch.int32, device=DEV)
++    acc_batch = torch.tensor([0, 2, 9, 4, 3, 1], dtype=torch.int32, device=DEV)
++    row_indices = torch.tensor([1, 2, 4, 5], dtype=torch.int32, device=DEV)
++    qlens = _rand_qlens(N, t_max, cpu_gen, ragged=True)
++    states, recs, refs = [], [], []
++    for _ in range(L):
++        step = _Step(qlens, gen)
++        state, rec = _new_cache(N, gen, num_spec=t_max - 1)
++        o_ref, pool, idx = _reference(step, A_log, dt_bias, state[1:].clone(), t_max)
++        gdn_recover_verify(
++            step.q, step.k, step.v, step.a, step.b, A_log, dt_bias,
++            state, rec, step.cu, slots,
++        )  # fmt: skip
++        states.append(state)
++        recs.append(rec)
++        refs.append((pool, idx, step))
++    GDNRecoverCommitGroup(states, recs, num_k_heads=H).commit(
++        slots, refs[0][2].cu, acc_batch, row_indices=row_indices
++    )
++    n_acc = [
++        max(1, min(int(acc_batch[r]), q)) for r, q in zip(row_indices.tolist(), qlens)
++    ]
++    for layer, (pool, idx, _) in enumerate(refs):
++        ref = pool[idx[torch.arange(N), torch.tensor(n_acc) - 1].long()]
++        _assert_bitexact(states[layer][1:], ref, f"layer {layer} committed state")
++
++
++@pytest.mark.skipif(INTERPRET, reason="CUDA kernel")
++@pytest.mark.parametrize("t_max", [4, 8])
++@pytest.mark.parametrize("N", [1, 4, 32])
++def test_diff_vs_cuda_fused_kernel(N, t_max):
++    """Report (not require) the difference to the CUDA fused MTP kernel."""
++    if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp"):
++        pytest.skip("fused_gdn_decode_post_conv_mtp not built")
++    from vllm import _custom_ops as ops
++    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
++        rmsnorm_fn,
++    )
++
++    gen = torch.Generator(device=DEV).manual_seed(21 + N + t_max)
++    cpu_gen = torch.Generator().manual_seed(N * t_max)
++    qlens = [t_max] * N
++    step = _Step(qlens, gen)
++    A_log, dt_bias = _params(gen)
++    state, rec = _new_cache(N, gen, num_spec=t_max - 1)
++    slots = torch.arange(1, N + 1, dtype=torch.int32, device=DEV)
++    s0 = state[1:].clone()
++    gate = torch.randn((step.T, HV, V), generator=gen, device=DEV).to(torch.bfloat16)
++    norm_w = (1 + 0.1 * torch.randn(V, generator=gen, device=DEV)).to(torch.bfloat16)
++    eps = 1e-6
++
++    # CUDA path: per-token states in [N, t_max] slots, accepted offset 1.
++    pool = torch.zeros((1 + N * t_max, HV, V, K), device=DEV)
++    idx = torch.arange(1, 1 + N * t_max, device=DEV, dtype=torch.int32).view(N, t_max)
++    pool[idx[:, 0].long()] = s0
++    out_cuda = torch.empty((step.T, HV, V), device=DEV, dtype=torch.bfloat16)
++    ops.fused_gdn_decode_post_conv_mtp(
++        mixed_qkv=step.mixed_qkv,
++        a=step.a.contiguous(),
++        b=step.b.contiguous(),
++        A_log=A_log,
++        dt_bias=dt_bias,
++        state_indices=idx,
++        cu_seqlens=step.cu,
++        num_accepted_tokens=torch.ones(N, dtype=torch.int32, device=DEV),
++        state=pool,
++        output_gate=gate,
++        norm_weight=norm_w,
++        out=out_cuda,
++        scale=K**-0.5,
++        norm_eps=eps,
++        output_gate_activation="silu",
++    )
++
++    o = gdn_recover_verify(
++        step.q, step.k, step.v, step.a, step.b, A_log, dt_bias,
++        state, rec, step.cu, slots,
++    )  # fmt: skip
++    out_rec = rmsnorm_fn(
++        o, norm_w, None, z=gate, eps=eps, norm_before_gate=True, activation="silu"
++    )
++    acc = torch.tensor(
++        [int(torch.randint(1, t_max + 1, (1,), generator=cpu_gen)) for _ in qlens],
++        dtype=torch.int32,
++        device=DEV,
++    )
++    GDNRecoverCommitGroup([state], [rec], num_k_heads=H).commit(slots, step.cu, acc)
++    s_cuda = pool[idx[torch.arange(N), acc.long() - 1].long()]
++
++    def stats(x, y):
++        d = (x.float() - y.float()).abs()
++        return {
++            "max_abs": d.max().item(),
++            "max_rel": (d / y.float().abs().clamp_min(1e-6)).max().item(),
++            "mean_abs": d.mean().item(),
++            "ref_max_abs": y.float().abs().max().item(),
++            "frac_bitexact": (_bits(x) == _bits(y)).float().mean().item(),
++        }
++
++    res = {
++        "N": N,
++        "T": t_max,
++        "output": stats(out_rec, out_cuda),
++        "state": stats(state[1:], s_cuda),
++    }
++    print(json.dumps(res))
++    path = os.environ.get("GDN_RECOVER_DIFF_JSON")
++    if path:
++        with open(path, "a") as f:
++            f.write(json.dumps(res) + "\n")
++    torch.testing.assert_close(out_rec.float(), out_cuda.float(), atol=5e-2, rtol=5e-2)
++    torch.testing.assert_close(state[1:], s_cuda, atol=1e-3, rtol=1e-3)
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+new file mode 100644
+index 000000000..b2cd03e9b
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -0,0 +1,805 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN speculative-decoding verify without per-draft-token state writes.
++
++The baseline spec-decode path stores the full recurrent state after every
++verified token (one Mamba page per draft position). Here the verify keeps the
++state in registers, writes only small per-token *records* into a ring that
++lives in the request's single Mamba page, and a commit after sampling folds
++the accepted records into the checkpoint state:
++
++    record t:  u_t = beta_t * (v_t - S_{t-1} k_t)   fp32 [HV, V]
++               k_t (raw, before l2norm)              act dtype [H, K]
++               g_t (log decay)                       fp32 [HV]
++    commit:    S <- exp(g_t) * S + u_t k_t^T   for the accepted t, in order
++
++The verify runs the same per-token recurrence (same code, same fp32 op order)
++as `fused_sigmoid_gating_delta_rule_update`, so outputs are bit-identical to
++the baseline Triton path. The commit replays in the same forward order, so
++the committed state is bit-identical to the baseline's per-token state.
++
++Window `W` (records kept unfolded across steps) is a hook for later use:
++with W > 1 the verify first replays the pending records in registers and the
++commit folds only once W tokens are pending (or on `force`). B4 uses W = 1:
++every step folds, so the ring is empty between steps and no tracker is read.
++
++State codec: every checkpoint load/store goes through `gdn_spec_load_state` /
++`gdn_spec_store_state`, dispatched on the constexpr `FMT`. Only fp32 is
++implemented; the others are reserved dispatch points (per-head rows are
++padded to `VP`, e.g. V + 2 for the int16 row-scaled format).
++"""
++
++from dataclasses import dataclass
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# State formats (constexpr FMT values).
++GDN_STATE_FMT_FP32 = 0
++GDN_STATE_FMT_BF16 = 1
++GDN_STATE_FMT_INT16_ROW = 2
++GDN_STATE_FMT_INT8_ROW = 3
++GDN_STATE_FMT_INT8_HAD32 = 4
++GDN_STATE_FORMATS = {
++    "fp32": GDN_STATE_FMT_FP32,
++    "bf16": GDN_STATE_FMT_BF16,
++    "int16_row": GDN_STATE_FMT_INT16_ROW,
++    "int8_row": GDN_STATE_FMT_INT8_ROW,
++    "int8_had32": GDN_STATE_FMT_INT8_HAD32,
++}
++_IMPLEMENTED_FORMATS = ("fp32",)
++
++_FMT_FP32 = tl.constexpr(GDN_STATE_FMT_FP32)
++
++# Same tiling as fused_sigmoid_gating_delta_rule_update: the identical layout
++# keeps every reduction in the same order, which bit-exactness relies on.
++_NUM_WARPS = 4
++_NUM_STAGES = 3
++
++
++def gdn_state_padded_rows(fmt: str, head_v_dim: int, head_k_dim: int) -> int:
++    """Rows `VP` of one head's stored state block [VP, K] for a state format."""
++    if fmt not in GDN_STATE_FORMATS:
++        raise ValueError(f"unknown GDN state format {fmt!r}")
++    if fmt not in _IMPLEMENTED_FORMATS:
++        raise NotImplementedError(f"GDN spec state format {fmt!r} is not implemented")
++    return head_v_dim
++
++
++def gdn_recover_ring_len(num_spec: int, window: int = 1) -> int:
++    """Ring rows R per head: W - 1 pending + (num_spec + 1) verified, + 1."""
++    return window + num_spec + 1
++
++
++def gdn_recover_ring_shapes(
++    num_k_heads: int,
++    num_v_heads: int,
++    head_k_dim: int,
++    head_v_dim: int,
++    num_spec: int,
++    window: int = 1,
++) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
++    """Per-slot shapes of the (u, k, g) record rings."""
++    r = gdn_recover_ring_len(num_spec, window)
++    return (
++        (num_v_heads, r, head_v_dim),
++        (num_k_heads, r, head_k_dim),
++        (num_v_heads, r),
++    )
++
++
++# --------------------------------------------------------------------------
++# State codec
++# --------------------------------------------------------------------------
++
++
++@triton.jit
++def gdn_spec_load_state(
++    p_head, o_v, o_k, mask_v, mask_h, K: tl.constexpr, FMT: tl.constexpr
++):
++    """Load rows `o_v` of one head's stored block [VP, K] as fp32 [BV, BK]."""
++    tl.static_assert(FMT == _FMT_FP32, "GDN spec state format not implemented")
++    return tl.load(p_head + o_v[:, None] * K + o_k[None, :], mask=mask_h, other=0).to(
++        tl.float32
++    )
++
++
++@triton.jit
++def gdn_spec_store_state(
++    p_head, b_h, o_v, o_k, mask_v, mask_h, K: tl.constexpr, FMT: tl.constexpr
++):
++    """Encode fp32 rows [BV, BK] into one head's stored block [VP, K]."""
++    tl.static_assert(FMT == _FMT_FP32, "GDN spec state format not implemented")
++    p = p_head + o_v[:, None] * K + o_k[None, :]
++    tl.store(p, b_h.to(p.dtype.element_ty), mask=mask_h)
++
++
++# --------------------------------------------------------------------------
++# Record replay (commit, and W > 1 verify)
++# --------------------------------------------------------------------------
++
++
++@triton.jit
++def _gdn_replay_record(
++    b_h,
++    p_u,
++    p_rk,
++    p_g,
++    mask_k,
++    mask_v,
++    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++):
++    """S <- exp(g) * S + u k^T for one record, as the verify recurrence does.
++
++    The verify's `b_h += b_v[:, None] * b_k[None, :]` contracts to
++    fma(u, k, b_h * exp(g)) because `b_h * exp(g)` has a second use there
++    (S k). The fma is spelled out so the replay contracts the same way.
++    """
++    b_u = tl.load(p_u, mask=mask_v, other=0).to(tl.float32)
++    b_k = tl.load(p_rk, mask=mask_k, other=0).to(tl.float32)
++    b_g = tl.load(p_g).to(tl.float32)
++    if USE_QK_L2NORM_IN_KERNEL:
++        b_k = b_k * (tl.rsqrt(tl.sum(b_k * b_k) + 1e-6))
++    b_h *= tl.exp(b_g)
++    b_h = tl.fma(b_u[:, None], b_k[None, :], b_h)
++    return b_h
++
++
++# --------------------------------------------------------------------------
++# Verify
++# --------------------------------------------------------------------------
++
++
++@triton.jit(do_not_specialize=["T"])
++def _gdn_recover_verify_kernel(
++    A_log,
++    a,
++    b,
++    dt_bias,
++    q,
++    k,
++    v,
++    o,
++    state,
++    rec_u,
++    rec_k,
++    rec_g,
++    ring_start,
++    ring_pending,
++    cu_seqlens,
++    slot_indices,
++    beta,
++    threshold,
++    scale,
++    T,
++    stride_q_tok,
++    stride_k_tok,
++    stride_v_tok,
++    stride_a_tok,
++    stride_b_tok,
++    stride_o_tok,
++    stride_state_slot,
++    stride_u_slot,
++    stride_rk_slot,
++    stride_g_slot,
++    stride_slot_idx,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    VP: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    R: tl.constexpr,
++    W: tl.constexpr,
++    FMT: tl.constexpr,
++    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++):
++    i_v, i_nh = tl.program_id(0), tl.program_id(1)
++    i_n, i_hv = i_nh // HV, i_nh % HV
++    i_h = i_hv // (HV // H)
++    bos, eos = (
++        tl.load(cu_seqlens + i_n).to(tl.int64),
++        tl.load(cu_seqlens + i_n + 1).to(tl.int64),
++    )
++    T = eos - bos
++    if T == 0:
++        return
++
++    o_k = tl.arange(0, BK)
++    o_v = i_v * BV + tl.arange(0, BV)
++
++    p_q = q + bos * stride_q_tok + i_h * K + o_k
++    p_k = k + bos * stride_k_tok + i_h * K + o_k
++    p_v = v + bos * stride_v_tok + i_hv * V + o_v
++    p_A_log = A_log + i_hv
++    p_a = a + bos * stride_a_tok + i_hv
++    p_dt_bias = dt_bias + i_hv
++    p_b = b + bos * stride_b_tok + i_hv
++    p_o = o + bos * stride_o_tok + i_hv * V + o_v
++
++    mask_k = o_k < K
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & mask_k[None, :]
++
++    slot = tl.load(slot_indices + i_n * stride_slot_idx).to(tl.int64)
++    # Skip invalid slots (NULL_BLOCK_ID=0 / padding), as the baseline does.
++    if slot <= 0:
++        return
++
++    b_h = tl.zeros([BV, BK], dtype=tl.float32)
++    p_state = state + slot * stride_state_slot + i_hv * VP * K
++    b_h += gdn_spec_load_state(p_state, o_v, o_k, mask_v, mask_h, K, FMT)
++
++    p_u = rec_u + slot * stride_u_slot + i_hv * R * V + o_v
++    p_rk = rec_k + slot * stride_rk_slot + i_h * R * K + o_k
++    p_g = rec_g + slot * stride_g_slot + i_hv * R
++    pos0 = 0
++    if W > 1:
++        start = tl.load(ring_start + slot)
++        pending = tl.load(ring_pending + slot)
++        for j in range(0, pending):
++            pos = (start + j) % R
++            b_h = _gdn_replay_record(
++                b_h,
++                p_u + pos * V,
++                p_rk + pos * K,
++                p_g + pos,
++                mask_k,
++                mask_v,
++                USE_QK_L2NORM_IN_KERNEL,
++            )
++        pos0 = start + pending
++    store_k = (i_v == 0) & (i_hv % (HV // H) == 0)
++
++    for i_t in range(0, T):
++        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
++        b_k_raw = tl.load(p_k, mask=mask_k, other=0)
++        b_k = b_k_raw.to(tl.float32)
++        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
++        b_b = tl.load(p_b).to(tl.float32)
++
++        # --- identical to fused_sigmoid_gating_delta_rule_update (GDN) ---
++        x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
++        softplus_x = tl.where(
++            beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
++        )
++        b_g = -tl.exp(tl.load(p_A_log).to(tl.float32)) * softplus_x
++        b_beta = tl.sigmoid(b_b.to(tl.float32))
++        if USE_QK_L2NORM_IN_KERNEL:
++            b_q = b_q * (tl.rsqrt(tl.sum(b_q * b_q) + 1e-6))
++            b_k = b_k * (tl.rsqrt(tl.sum(b_k * b_k) + 1e-6))
++        b_q = b_q * scale
++        b_h *= tl.exp(b_g)
++        b_v -= tl.sum(b_h * b_k[None, :], 1)
++        b_v *= b_beta
++        b_h += b_v[:, None] * b_k[None, :]
++        b_o = tl.sum(b_h * b_q[None, :], 1)
++        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
++        # --- end identical part ---
++
++        # Records instead of the per-token state store.
++        pos = (pos0 + i_t) % R
++        tl.store(p_u + pos * V, b_v, mask=mask_v)
++        if i_v == 0:
++            tl.store(p_g + pos, b_g)
++        if store_k:
++            tl.store(p_rk + pos * K, b_k_raw, mask=mask_k)
++
++        p_q += stride_q_tok
++        p_k += stride_k_tok
++        p_o += stride_o_tok
++        p_v += stride_v_tok
++        p_b += stride_b_tok
++        p_a += stride_a_tok
++
++
++@dataclass
++class GDNRecoverRecords:
++    """One GDN layer's record rings, viewed per Mamba slot.
++
++    u: [num_slots, HV, R, V] float32
++    k: [num_slots, H, R, K] activation dtype (raw key, before l2norm)
++    g: [num_slots, HV, R] float32
++    """
++
++    u: torch.Tensor
++    k: torch.Tensor
++    g: torch.Tensor
++
++    @property
++    def ring_len(self) -> int:
++        return self.u.shape[2]
++
++    @classmethod
++    def allocate(
++        cls,
++        num_slots: int,
++        num_k_heads: int,
++        num_v_heads: int,
++        head_k_dim: int,
++        head_v_dim: int,
++        num_spec: int,
++        dtype: torch.dtype,
++        device: torch.device | str,
++        window: int = 1,
++    ) -> "GDNRecoverRecords":
++        u_shape, k_shape, g_shape = gdn_recover_ring_shapes(
++            num_k_heads, num_v_heads, head_k_dim, head_v_dim, num_spec, window
++        )
++        return cls(
++            torch.zeros((num_slots, *u_shape), dtype=torch.float32, device=device),
++            torch.zeros((num_slots, *k_shape), dtype=dtype, device=device),
++            torch.zeros((num_slots, *g_shape), dtype=torch.float32, device=device),
++        )
++
++
++@dataclass
++class GDNRecoverTrackers:
++    """Per-slot ring trackers, shared by the layers of one cache group (W > 1).
++
++    ring_start: first pending record; num_pending: accepted, unfolded records
++    (ReplaySSM's `_replayssm_ring_start` / `_replayssm_prev_num_accepted`)."""
++
++    ring_start: torch.Tensor  # [num_slots] int32
++    num_pending: torch.Tensor  # [num_slots] int32
++
++
++def _check_head_contiguous(name: str, x: torch.Tensor) -> None:
++    if x.stride(-1) != 1 or (x.dim() >= 2 and x.stride(-2) != x.shape[-1]):
++        raise ValueError(f"GDN recover verify: {name} heads must be contiguous")
++
++
++def gdn_recover_verify(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    state: torch.Tensor,
++    records: GDNRecoverRecords,
++    cu_seqlens: torch.Tensor,
++    slot_indices: torch.Tensor,
++    out: torch.Tensor | None = None,
++    scale: float | None = None,
++    window: int = 1,
++    trackers: GDNRecoverTrackers | None = None,
++    fmt: str = "fp32",
++    softplus_beta: float = 1.0,
++    softplus_threshold: float = 20.0,
++    use_qk_l2norm_in_kernel: bool = True,
++) -> torch.Tensor:
++    """Verify spec tokens off each request's checkpoint without storing states.
++
++    q, k: [T, H, K]; v: [T, HV, V]; a, b: [T, HV] (token-strided views are
++    fine, e.g. straight out of the packed conv output); state: [slots, HV, VP, K];
++    cu_seqlens: [N + 1]; slot_indices: [N] (or a strided column). Returns
++    out [T, HV, V] (same values as fused_sigmoid_gating_delta_rule_update).
++    Writes request n's records to ring rows of slot_indices[n]; slots <= 0
++    are skipped (no output, no records).
++    """
++    if q.dim() == 4:
++        q, k, v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
++    if a.dim() == 3:
++        a, b = a.squeeze(0), b.squeeze(0)
++    T, H, K = k.shape
++    HV, V = v.shape[1], v.shape[2]
++    VP = gdn_state_padded_rows(fmt, V, K)
++    for name, x in (("q", q), ("k", k), ("v", v)):
++        _check_head_contiguous(name, x)
++    if a.stride(-1) != 1 or b.stride(-1) != 1:
++        raise ValueError("GDN recover verify: a and b heads must be contiguous")
++    if state.shape[1:] != (HV, VP, K) or state.stride()[1:] != (VP * K, K, 1):
++        raise ValueError(f"GDN recover verify: bad state shape {tuple(state.shape)}")
++    if records.k.dtype != k.dtype:
++        raise ValueError("GDN recover verify: key record dtype must match k")
++    R = records.ring_len
++    for name, x in (("u", records.u), ("k", records.k), ("g", records.g)):
++        if not x[0].is_contiguous():
++            raise ValueError(f"GDN recover verify: {name} records must be contiguous")
++    if window > 1 and trackers is None:
++        raise ValueError("GDN recover verify: window > 1 needs ring trackers")
++    if out is None:
++        out = torch.empty((T, HV, V), dtype=q.dtype, device=q.device)
++    elif out.dim() == 4:
++        out = out.squeeze(0)
++    _check_head_contiguous("out", out)
++    if scale is None:
++        scale = K**-0.5
++    N = cu_seqlens.shape[0] - 1
++    if N == 0 or T == 0:
++        return out
++    BK = triton.next_power_of_2(K)
++    BV = min(triton.next_power_of_2(V), 32)
++    assert BK == K, "K must be a power of two"
++    NV = triton.cdiv(V, BV)
++    ring_start = trackers.ring_start if trackers is not None else slot_indices
++    ring_pending = trackers.num_pending if trackers is not None else slot_indices
++    grid = (NV, N * HV)
++    _gdn_recover_verify_kernel[grid](
++        A_log,
++        a,
++        b,
++        dt_bias,
++        q,
++        k,
++        v,
++        out,
++        state,
++        records.u,
++        records.k,
++        records.g,
++        ring_start,
++        ring_pending,
++        cu_seqlens,
++        slot_indices,
++        softplus_beta,
++        softplus_threshold,
++        scale,
++        T,
++        q.stride(0),
++        k.stride(0),
++        v.stride(0),
++        a.stride(0),
++        b.stride(0),
++        out.stride(0),
++        state.stride(0),
++        records.u.stride(0),
++        records.k.stride(0),
++        records.g.stride(0),
++        slot_indices.stride(0),
++        H=H,
++        HV=HV,
++        K=K,
++        V=V,
++        VP=VP,
++        BK=BK,
++        BV=BV,
++        R=R,
++        W=window,
++        FMT=GDN_STATE_FORMATS[fmt],
++        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
++        num_warps=_NUM_WARPS,
++        num_stages=_NUM_STAGES,
++    )
++    return out
++
++
++# --------------------------------------------------------------------------
++# Commit
++# --------------------------------------------------------------------------
++
++
++@triton.heuristics(
++    {
++        "HAS_ROW_INDICES": lambda args: args["row_indices"] is not None,
++        "HAS_DST_SLOTS": lambda args: args["dst_slots"] is not None,
++        "HAS_BOUNDARY": lambda args: args["boundary_slots"] is not None,
++        "HAS_FORCE_ROWS": lambda args: args["force_rows"] is not None,
++    }
++)
++@triton.jit
++def _gdn_recover_plan_kernel(
++    slot_indices,
++    cu_seqlens,
++    num_accepted,
++    row_indices,
++    dst_slots,
++    boundary_slots,
++    boundary_lens,
++    ring_start,
++    ring_pending,
++    plan,
++    force,
++    force_rows,
++    stride_slot_idx,
++    W: tl.constexpr,
++    HAS_ROW_INDICES: tl.constexpr,
++    HAS_DST_SLOTS: tl.constexpr,
++    HAS_BOUNDARY: tl.constexpr,
++    HAS_FORCE_ROWS: tl.constexpr,
++):
++    """Per request: how many records to fold, from where, and to where.
++
++    plan[n] = (src_slot, dst_slot, fold_start, fold_count, boundary_slot,
++    boundary_count): fold records fold_start .. fold_start + fold_count - 1
++    (ring order) into src's state, store the result to dst; with a boundary,
++    also store the state after the first boundary_count of them to
++    boundary_slot. Updates the trackers (read-before-write per request; the
++    commit reads only the plan)."""
++    i_n = tl.program_id(0)
++    p_plan = plan + i_n * 6
++    slot = tl.load(slot_indices + i_n * stride_slot_idx).to(tl.int32)
++    qlen = (tl.load(cu_seqlens + i_n + 1) - tl.load(cu_seqlens + i_n)).to(tl.int32)
++    row = i_n
++    if HAS_ROW_INDICES:
++        row = tl.load(row_indices + i_n)
++    valid = slot > 0
++    # The baseline reads the state after max(num_sampled, 1) tokens. A row
++    # without tokens (qlen 0) only folds its pending records (forced).
++    n_acc = tl.minimum(tl.maximum(tl.load(num_accepted + row).to(tl.int32), 1), qlen)
++    n_acc = tl.where(valid & (qlen > 0), n_acc, 0)
++    start = 0
++    pending = 0
++    if W > 1:
++        start = tl.load(ring_start + slot, mask=valid, other=0)
++        pending = tl.load(ring_pending + slot, mask=valid, other=0)
++    total = pending + n_acc
++    forced = force != 0
++    if HAS_FORCE_ROWS:
++        forced = forced | (tl.load(force_rows + i_n) != 0)
++    do_fold = valid & (total > 0) & ((total >= W) | forced)
++    dst = slot
++    if HAS_DST_SLOTS:
++        dst = tl.load(dst_slots + i_n).to(tl.int32)
++    b_slot = 0
++    b_count = 0
++    if HAS_BOUNDARY:
++        b_slot = tl.load(boundary_slots + i_n).to(tl.int32)
++        # boundary_lens counts this step's tokens; the replay also covers the
++        # pending records ahead of them.
++        b_count = pending + tl.load(boundary_lens + i_n).to(tl.int32)
++        b_ok = do_fold & (b_slot > 0) & (b_count > 0) & (b_count <= total)
++        b_slot = tl.where(b_ok, b_slot, 0)
++    tl.store(p_plan + 0, slot)
++    tl.store(p_plan + 1, dst)
++    tl.store(p_plan + 2, start)
++    tl.store(p_plan + 3, tl.where(do_fold, total, 0))
++    tl.store(p_plan + 4, b_slot)
++    tl.store(p_plan + 5, b_count)
++    if W > 1:
++        tl.store(ring_start + slot, tl.where(do_fold, 0, start), mask=valid)
++        tl.store(ring_pending + slot, tl.where(do_fold, 0, total), mask=valid)
++
++
++@triton.jit
++def _gdn_recover_commit_kernel(
++    state_addrs,
++    u_addrs,
++    rk_addrs,
++    g_addrs,
++    state_ref,
++    u_ref,
++    rk_ref,
++    g_ref,
++    plan,
++    stride_state_slot,
++    stride_u_slot,
++    stride_rk_slot,
++    stride_g_slot,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    VP: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    R: tl.constexpr,
++    FMT: tl.constexpr,
++    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++):
++    """Fold planned records into the checkpoint, all layers of a group at once."""
++    i_v, i_n, i_lh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    i_l, i_hv = i_lh // HV, i_lh % HV
++    i_h = i_hv // (HV // H)
++    p_plan = plan + i_n * 6
++    count = tl.load(p_plan + 3)
++    if count == 0:
++        return
++    src = tl.load(p_plan + 0).to(tl.int64)
++    dst = tl.load(p_plan + 1).to(tl.int64)
++    start = tl.load(p_plan + 2)
++    b_slot = tl.load(p_plan + 4).to(tl.int64)
++    b_count = tl.load(p_plan + 5)
++
++    state = tl.load(state_addrs + i_l).to(tl.pointer_type(state_ref.dtype.element_ty))
++    rec_u = tl.load(u_addrs + i_l).to(tl.pointer_type(u_ref.dtype.element_ty))
++    rec_k = tl.load(rk_addrs + i_l).to(tl.pointer_type(rk_ref.dtype.element_ty))
++    rec_g = tl.load(g_addrs + i_l).to(tl.pointer_type(g_ref.dtype.element_ty))
++
++    o_k = tl.arange(0, BK)
++    o_v = i_v * BV + tl.arange(0, BV)
++    mask_k = o_k < K
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & mask_k[None, :]
++
++    b_h = tl.zeros([BV, BK], dtype=tl.float32)
++    b_h += gdn_spec_load_state(
++        state + src * stride_state_slot + i_hv * VP * K,
++        o_v,
++        o_k,
++        mask_v,
++        mask_h,
++        K,
++        FMT,
++    )
++    p_u = rec_u + src * stride_u_slot + i_hv * R * V + o_v
++    p_rk = rec_k + src * stride_rk_slot + i_h * R * K + o_k
++    p_g = rec_g + src * stride_g_slot + i_hv * R
++    for j in range(0, count):
++        pos = (start + j) % R
++        b_h = _gdn_replay_record(
++            b_h,
++            p_u + pos * V,
++            p_rk + pos * K,
++            p_g + pos,
++            mask_k,
++            mask_v,
++            USE_QK_L2NORM_IN_KERNEL,
++        )
++        if (b_slot > 0) & (j + 1 == b_count):
++            gdn_spec_store_state(
++                state + b_slot * stride_state_slot + i_hv * VP * K,
++                b_h,
++                o_v,
++                o_k,
++                mask_v,
++                mask_h,
++                K,
++                FMT,
++            )
++    gdn_spec_store_state(
++        state + dst * stride_state_slot + i_hv * VP * K,
++        b_h,
++        o_v,
++        o_k,
++        mask_v,
++        mask_h,
++        K,
++        FMT,
++    )
++
++
++class GDNRecoverCommitGroup:
++    """Device address tables for committing one cache group's GDN layers in
++    one launch. All layers must share shapes, dtypes and slot strides."""
++
++    def __init__(
++        self,
++        states: list[torch.Tensor],
++        records: list[GDNRecoverRecords],
++        num_k_heads: int,
++        fmt: str = "fp32",
++        window: int = 1,
++        trackers: GDNRecoverTrackers | None = None,
++        use_qk_l2norm_in_kernel: bool = True,
++    ) -> None:
++        if not states or len(states) != len(records):
++            raise ValueError("GDN recover commit: need one record set per state")
++        s0, r0 = states[0], records[0]
++        for s, r in zip(states, records):
++            if (
++                s.shape[1:] != s0.shape[1:]
++                or s.dtype != s0.dtype
++                or s.stride() != s0.stride()
++            ):
++                raise ValueError("GDN recover commit: layer states differ")
++            for x, x0 in ((r.u, r0.u), (r.k, r0.k), (r.g, r0.g)):
++                if x.shape[1:] != x0.shape[1:] or x.dtype != x0.dtype:
++                    raise ValueError("GDN recover commit: layer records differ")
++                if x.stride() != x0.stride():
++                    raise ValueError("GDN recover commit: layer record strides differ")
++        if window > 1 and trackers is None:
++            raise ValueError("GDN recover commit: window > 1 needs ring trackers")
++        self.states = states
++        self.records = records
++        self.HV, VP, self.K = s0.shape[1:]
++        self.V = r0.u.shape[-1]
++        self.H = num_k_heads
++        self.fmt = fmt
++        if VP != gdn_state_padded_rows(fmt, self.V, self.K):
++            raise ValueError("GDN recover commit: state rows do not match format")
++        self.VP = VP
++        self.window = window
++        self.trackers = trackers
++        self.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
++        device = s0.device
++
++        def addrs(ts: list[torch.Tensor]) -> torch.Tensor:
++            return torch.tensor([t.data_ptr() for t in ts], dtype=torch.int64).to(
++                device
++            )
++
++        self.state_addrs = addrs(states)
++        self.u_addrs = addrs([r.u for r in records])
++        self.k_addrs = addrs([r.k for r in records])
++        self.g_addrs = addrs([r.g for r in records])
++        self._plan: torch.Tensor | None = None
++
++    def _plan_buffer(self, n: int) -> torch.Tensor:
++        if self._plan is None or self._plan.shape[0] < n:
++            self._plan = torch.empty(
++                (max(n, 64), 6), dtype=torch.int32, device=self.states[0].device
++            )
++        return self._plan[:n]
++
++    def commit(
++        self,
++        slot_indices: torch.Tensor,
++        cu_seqlens: torch.Tensor,
++        num_accepted: torch.Tensor,
++        row_indices: torch.Tensor | None = None,
++        force: bool = False,
++        force_rows: torch.Tensor | None = None,
++        dst_slots: torch.Tensor | None = None,
++        boundary_slots: torch.Tensor | None = None,
++        boundary_lens: torch.Tensor | None = None,
++    ) -> None:
++        """Fold each request's accepted records into its checkpoint.
++
++        slot_indices: [N] slots verified this step (<= 0: skip); cu_seqlens:
++        [N + 1]; num_accepted[row_indices[n] or n]: tokens accepted by
++        request n (clamped to [1, query_len], like the baseline). With
++        window > 1 the fold happens once `window` records are pending or on
++        `force` / force_rows[n] != 0 (align boundary, finish, preemption; a
++        row with query length 0 then folds only its pending records). dst_slots (default: in
++        place) and boundary_slots/boundary_lens (also store the state after
++        boundary_lens[n] of this step's tokens; align mode) are optional.
++        """
++        N = cu_seqlens.shape[0] - 1
++        if N <= 0:
++            return
++        plan = self._plan_buffer(N)
++        tr = self.trackers
++        _gdn_recover_plan_kernel[(N,)](
++            slot_indices,
++            cu_seqlens,
++            num_accepted,
++            row_indices,
++            dst_slots,
++            boundary_slots,
++            boundary_lens,
++            tr.ring_start if tr is not None else slot_indices,
++            tr.num_pending if tr is not None else slot_indices,
++            plan,
++            int(force),
++            force_rows,
++            slot_indices.stride(0),
++            W=self.window,
++            num_warps=1,
++        )
++        s0, r0 = self.states[0], self.records[0]
++        BK = triton.next_power_of_2(self.K)
++        BV = min(triton.next_power_of_2(self.V), 32)
++        grid = (triton.cdiv(self.V, BV), N, len(self.states) * self.HV)
++        _gdn_recover_commit_kernel[grid](
++            self.state_addrs,
++            self.u_addrs,
++            self.k_addrs,
++            self.g_addrs,
++            s0,
++            r0.u,
++            r0.k,
++            r0.g,
++            plan,
++            s0.stride(0),
++            r0.u.stride(0),
++            r0.k.stride(0),
++            r0.g.stride(0),
++            H=self.H,
++            HV=self.HV,
++            K=self.K,
++            V=self.V,
++            VP=self.VP,
++            BK=BK,
++            BV=BV,
++            R=r0.ring_len,
++            FMT=GDN_STATE_FORMATS[self.fmt],
++            USE_QK_L2NORM_IN_KERNEL=self.use_qk_l2norm_in_kernel,
++            num_warps=_NUM_WARPS,
++            num_stages=_NUM_STAGES,
++        )
++
++
++def gdn_recover_reset_trackers(
++    trackers: GDNRecoverTrackers | None, slots: torch.Tensor
++) -> None:
++    """Prefill wrote fresh states to `slots`: no pending records remain."""
++    if trackers is None or slots.numel() == 0:
++        return
++    idx = slots.long().clamp_min(0)
++    trackers.ring_start.index_fill_(0, idx, 0)
++    trackers.num_pending.index_fill_(0, idx, 0)

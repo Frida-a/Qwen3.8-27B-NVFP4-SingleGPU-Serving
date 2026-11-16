@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:37:44 -0800
+Subject: [PATCH] [Attention] FlashInfer SM120 FP8 prefill: gather compact K/V
+ planes
+
+vLLM's FlashInfer cache interleaves K|V per token (LBHNC, C = 2*head_size), so a
+K plane has token stride 2*D; the cute-dsl-prims kernel only accepts compact
+[Hkv, page, D] planes. Gather the prefill requests' pages into compact K and V
+tensors per layer (index_select, ~2 x pages x Hkv x page x D bytes) and plan
+the wrapper on indices 0..n-1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/backends/flashinfer.py | 34 +++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index bf2cb441a..804f4ecad 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -755,6 +755,11 @@ class FIPrefill:
+     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
+ 
+     wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
++    # SM120 FP8 prefill: physical pages of the prefill requests (in plan order).
++    # The cute-dsl-prims kernel needs compact [Hkv, page, D] K and V planes, but
++    # vLLM interleaves K|V per token, so forward() gathers these pages into
++    # compact planes and the wrapper is planned on indices 0..n-1.
++    sm120_gather: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -1952,10 +1957,23 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     o_dtype = (
+                         FP8_DTYPE if self.nvfp4_trtllm else self.model_config.dtype
+                     )
++                    sm120_gather = None
++                    plan_kv_indptr = paged_kv_indptr_prefill_cpu
++                    plan_kv_indices = paged_kv_indices
++                    if self.sm120_fp8_prefill:
++                        p0 = int(paged_kv_indptr_prefill_cpu[0])
++                        p1 = int(paged_kv_indptr_prefill_cpu[-1])
++                        sm120_gather = paged_kv_indices[p0:p1]
++                        plan_kv_indptr = paged_kv_indptr_prefill_cpu - p0
++                        if PIN_MEMORY:
++                            plan_kv_indptr = plan_kv_indptr.pin_memory()
++                        plan_kv_indices = torch.arange(
++                            p1 - p0, dtype=paged_kv_indices.dtype, device=self.device
++                        )
+                     prefill_wrapper.plan(
+                         qo_indptr=qo_indptr_prefill_cpu,
+-                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+-                        paged_kv_indices=paged_kv_indices,
++                        paged_kv_indptr=plan_kv_indptr,
++                        paged_kv_indices=plan_kv_indices,
+                         paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                         seq_lens=kv_lens_prefill_cpu,
+                         num_qo_heads=self.num_qo_heads,
+@@ -1972,7 +1990,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                         fixed_split_size=self.prefill_fixed_split_size,
+                         disable_split_kv=self.disable_split_kv,
+                     )
+-                attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
++                attn_metadata.prefill = FIPrefill(
++                    wrapper=prefill_wrapper,
++                    sm120_gather=None if self.use_dcp else sm120_gather,
++                )
+ 
+         ## DECODE PATHWAY
+         if num_decodes > 0:
+@@ -2495,6 +2516,13 @@ class FlashInferImpl(AttentionImpl):
+ 
+                     if self.is_kvcache_nvfp4:
+                         kv_cache_for_fi = nvfp4_kv_data
++                    elif attn_metadata.prefill.sm120_gather is not None:
++                        # compact K and V planes of the prefill requests' pages
++                        g = attn_metadata.prefill.sm120_gather
++                        kv_cache_for_fi = tuple(
++                            t.view(torch.uint8).index_select(0, g).view(t.dtype)
++                            for t in kv_cache_tuple
++                        )
+                     else:
+                         kv_cache_for_fi = kv_cache_tuple
+                     kv_cache_sf = (

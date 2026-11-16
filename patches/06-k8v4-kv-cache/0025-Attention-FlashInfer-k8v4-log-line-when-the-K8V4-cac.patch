@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:19:26 -0800
+Subject: [PATCH] [Attention] FlashInfer k8v4: log line when the K8V4 cache is
+ active
+
+Proof-of-run line for the kernel admission gate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/backends/flashinfer.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index f591d6c6a..f70a8f398 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -1026,6 +1026,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     raise NotImplementedError("k8v4 KV cache does not support DCP")
+                 self.is_kvcache_k8v4 = True
+                 self.cache_dtype = "fp8_e4m3"
++                logger.info_once(
++                    "K8V4 KV cache active: FP8 keys + NVFP4 values (Triton "
++                    "k8v4_store / k8v4_decode; prefill on gathered FP8 pages)"
++                )
+             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
+             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
+             self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")

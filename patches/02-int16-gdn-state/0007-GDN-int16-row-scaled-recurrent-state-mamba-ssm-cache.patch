@@ -1,0 +1,1028 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:02:21 -0800
+Subject: [PATCH] [GDN] int16 row-scaled recurrent state
+ (--mamba-ssm-cache-dtype int16)
+
+Stores the GatedDeltaNet state as int16 codes plus one fp32 scale per
+(head, v) row, packed per head as [V + 2, K] int16 so whole-block copies
+(prefix-cache align mode, spec decode) stay format-agnostic. Kernels load
+code*scale into fp32 and re-quantize on every store (amax/32767, rint).
+
+- packed non-spec decode and fused sigmoid-gating (spec/mixed) decode:
+  STATE_INT16 constexpr path
+- prefill: Triton chunk backend forced; int16 dequant gather / quant
+  scatter kernels around it
+- MTP CUDA kernel falls back to the Triton spec path (unsupported dtype)
+- warmup, state shape/dtype plumbing, unit tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Release note: rebased onto the recover-spec patches (01-*). The two conflict
+hunks (imports in qwen_gdn_linear_attn.py; MambaStateDtypeCalculator in
+mamba_utils.py) are resolved exactly as in the measured build's merge commit.
+---
+ tests/kernels/mamba/test_gdn_state_int16.py   | 225 ++++++++++++++++
+ vllm/config/cache.py                          |   6 +-
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  |  48 +++-
+ .../layers/mamba/mamba_utils.py               |  26 +-
+ .../layers/mamba/ops/gdn_state_int16.py       | 253 ++++++++++++++++++
+ vllm/model_executor/models/qwen3_5.py         |   2 +
+ vllm/model_executor/models/qwen3_next.py      |   1 +
+ .../warmup/qwen_triton_warmup.py              |  34 +++
+ vllm/models/qwen3_5/nvidia/model.py           |   2 +
+ .../ops/fused_recurrent.py                    |  42 ++-
+ .../ops/fused_sigmoid_gating.py               |  47 +++-
+ vllm/utils/torch_utils.py                     |   1 +
+ 12 files changed, 662 insertions(+), 25 deletions(-)
+ create mode 100644 tests/kernels/mamba/test_gdn_state_int16.py
+ create mode 100644 vllm/model_executor/layers/mamba/ops/gdn_state_int16.py
+
+diff --git a/tests/kernels/mamba/test_gdn_state_int16.py b/tests/kernels/mamba/test_gdn_state_int16.py
+new file mode 100644
+index 000000000..0fd50cc74
+--- /dev/null
++++ b/tests/kernels/mamba/test_gdn_state_int16.py
+@@ -0,0 +1,225 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""int16 row-scaled GDN recurrent state (`--mamba-ssm-cache-dtype int16`).
++
++Every kernel that reads/writes the int16 state is checked against the same
++kernel on an fp32 state that starts from identical (dequantized) values: the
++fp32 math must agree, and the stored state must equal the fp32 result
++re-quantized with the reference quantizer (codes within 1 LSB).
++"""
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
++    gather_initial_states,
++)
++from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
++    dequantize_state_int16_ref,
++    gather_initial_states_int16,
++    gdn_int16_state_rows,
++    quantize_state_int16_ref,
++    scatter_states_int16,
++)
++from vllm.platforms import current_platform
++from vllm.third_party.flash_linear_attention.ops import (
++    fused_recurrent_gated_delta_rule_packed_decode,
++)
++from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
++    fused_sigmoid_gating_delta_rule_update,
++)
++
++pytestmark = pytest.mark.skipif(
++    not current_platform.is_cuda(), reason="int16 GDN state is CUDA-only"
++)
++DEV = "cuda"
++K = V = 128
++
++
++def _rand_state(n, HV, gen, scale=1.0):
++    s = torch.randn((n, HV, V, K), device=DEV, generator=gen) * scale
++    # heavy-tailed rows, as in real GDN states
++    s[:, :, ::7] *= 30.0
++    return s
++
++
++def _assert_int16_matches(packed: torch.Tensor, ref_fp32: torch.Tensor, rows=None):
++    """Packed int16 state == quantize_ref(ref_fp32) up to 1 LSB per element."""
++    expect = quantize_state_int16_ref(ref_fp32)
++    got_deq = dequantize_state_int16_ref(packed, V)
++    exp_deq = dequantize_state_int16_ref(expect, V)
++    scale = exp_deq.abs().amax(-1, keepdim=True) / 32767.0
++    err = (got_deq - exp_deq).abs()
++    assert (err <= 1.01 * scale + 1e-30).all(), float((err / (scale + 1e-30)).max())
++    # and the dequantized state is within half an LSB (+1 LSB slack) of fp32
++    err_ref = (got_deq - ref_fp32).abs()
++    assert (err_ref <= 1.51 * scale + 1e-30).all()
++
++
++def test_layout_and_ref_roundtrip():
++    gen = torch.Generator(device=DEV).manual_seed(0)
++    x = _rand_state(3, 4, gen)
++    q = quantize_state_int16_ref(x)
++    assert q.dtype == torch.int16
++    assert q.shape == (3, 4, gdn_int16_state_rows(V, K), K) == (3, 4, V + 2, K)
++    y = dequantize_state_int16_ref(q, V)
++    amax = x.abs().amax(-1, keepdim=True)
++    assert ((y - x).abs() <= 0.5 * amax / 32767.0 * 1.0001 + 1e-30).all()
++    # zero rows stay exactly zero
++    x[0, 0, 3] = 0
++    y = dequantize_state_int16_ref(quantize_state_int16_ref(x), V)
++    assert (y[0, 0, 3] == 0).all()
++
++
++@pytest.mark.parametrize("strided_idx", [False, True])
++def test_gather_scatter(strided_idx):
++    gen = torch.Generator(device=DEV).manual_seed(1)
++    HV, n_slots = 6, 9
++    x = _rand_state(n_slots, HV, gen)
++    cache = quantize_state_int16_ref(x)
++    idx_full = torch.tensor([3, 0, 7, 5, 1, 2], device=DEV, dtype=torch.int32)
++    idx = idx_full[::2] if strided_idx else idx_full[:3]
++    has = torch.tensor([True, False, True], device=DEV)
++    got = gather_initial_states_int16(cache, idx, has, V)
++    exp = dequantize_state_int16_ref(cache, V)[idx.long()]
++    exp[~has] = 0
++    torch.testing.assert_close(got, exp, rtol=0, atol=0)
++    # same semantics as the fp32 gather
++    ref = gather_initial_states(dequantize_state_int16_ref(cache, V), idx, has)
++    torch.testing.assert_close(got, ref, rtol=0, atol=0)
++
++    src = _rand_state(3, HV, gen, scale=3.0)
++    scatter_states_int16(cache, src, idx)
++    for j, slot in enumerate(idx.tolist()):
++        _assert_int16_matches(cache[slot : slot + 1], src[j : j + 1])
++
++
++def _gating_inputs(B, H, HV, gen, dtype=torch.bfloat16):
++    qkv = torch.randn((B, 2 * H * K + HV * V), device=DEV, dtype=dtype, generator=gen)
++    a = torch.randn((B, HV), device=DEV, dtype=dtype, generator=gen)
++    b = torch.randn((B, HV), device=DEV, dtype=dtype, generator=gen)
++    A_log = torch.randn((HV,), device=DEV, dtype=torch.float32, generator=gen)
++    dt_bias = torch.randn((HV,), device=DEV, dtype=torch.float32, generator=gen)
++    return qkv, a, b, A_log, dt_bias
++
++
++@pytest.mark.parametrize("B,H,HV", [(1, 16, 48), (7, 4, 12), (64, 16, 48)])
++def test_packed_decode_int16_matches_fp32(B, H, HV):
++    gen = torch.Generator(device=DEV).manual_seed(2)
++    qkv, a, b, A_log, dt_bias = _gating_inputs(B, H, HV, gen)
++    idx = torch.arange(1, B + 1, device=DEV, dtype=torch.int32)
++    if B > 3:
++        idx[-1] = 0  # padded slot: untouched, output zero
++    s0 = _rand_state(B + 1, HV, gen)
++    cache16 = quantize_state_int16_ref(s0)
++    cache32 = dequantize_state_int16_ref(cache16, V).contiguous()
++    untouched16 = cache16[0].clone()
++
++    out16 = torch.empty((B, 1, HV, V), device=DEV, dtype=torch.bfloat16)
++    out32 = torch.empty_like(out16)
++    for st, out in ((cache16, out16), (cache32, out32)):
++        fused_recurrent_gated_delta_rule_packed_decode(
++            mixed_qkv=qkv,
++            a=a,
++            b=b,
++            A_log=A_log,
++            dt_bias=dt_bias,
++            scale=K**-0.5,
++            initial_state=st,
++            out=out,
++            ssm_state_indices=idx,
++            use_qk_l2norm_in_kernel=True,
++        )
++    valid = idx > 0
++    torch.testing.assert_close(out16[valid], out32[valid], rtol=0, atol=0)
++    _assert_int16_matches(cache16[idx[valid].long()], cache32[idx[valid].long()])
++    assert torch.equal(cache16[0], untouched16)
++
++
++@pytest.mark.parametrize("num_spec", [0, 3])
++def test_sigmoid_gating_update_int16_matches_fp32(num_spec):
++    """Spec-decode (multi-token, per-token state slots, num_accepted_tokens)
++    and plain varlen decode."""
++    gen = torch.Generator(device=DEV).manual_seed(3)
++    N, H, HV = 5, 4, 12
++    T_per = num_spec + 1
++    T = N * T_per
++    q = torch.randn((1, T, H, K), device=DEV, dtype=torch.bfloat16, generator=gen)
++    k = torch.randn((1, T, H, K), device=DEV, dtype=torch.bfloat16, generator=gen)
++    v = torch.randn((1, T, HV, V), device=DEV, dtype=torch.bfloat16, generator=gen)
++    a = torch.randn((1, T, HV), device=DEV, dtype=torch.bfloat16, generator=gen)
++    b = torch.randn((1, T, HV), device=DEV, dtype=torch.bfloat16, generator=gen)
++    A_log = torch.randn((HV,), device=DEV, generator=gen)
++    dt_bias = torch.randn((HV,), device=DEV, generator=gen)
++    cu = torch.arange(0, T + 1, T_per, device=DEV, dtype=torch.int32)
++    n_slots = 1 + N * T_per
++    s0 = _rand_state(n_slots, HV, gen)
++    cache16 = quantize_state_int16_ref(s0)
++    cache32 = dequantize_state_int16_ref(cache16, V).contiguous()
++    if num_spec:
++        idx = torch.arange(1, n_slots, device=DEV, dtype=torch.int32).view(N, T_per)
++        acc = torch.tensor([1, 2, 4, 3, 1], device=DEV, dtype=torch.int32)
++    else:
++        idx = torch.arange(1, N + 1, device=DEV, dtype=torch.int32)
++        acc = None
++    outs = []
++    for st in (cache16, cache32):
++        o, _ = fused_sigmoid_gating_delta_rule_update(
++            A_log=A_log,
++            a=a,
++            b=b,
++            dt_bias=dt_bias,
++            q=q,
++            k=k,
++            v=v,
++            initial_state=st,
++            inplace_final_state=True,
++            cu_seqlens=cu,
++            ssm_state_indices=idx,
++            num_accepted_tokens=acc,
++            use_qk_l2norm_in_kernel=True,
++        )
++        outs.append(o)
++    # Spec decode keeps the state in registers across the T tokens, so both
++    # paths do identical fp32 math from identical starting states.
++    torch.testing.assert_close(outs[0], outs[1], rtol=0, atol=0)
++    written = idx.flatten().long()
++    _assert_int16_matches(cache16[written], cache32[written])
++
++
++def test_long_decode_drift():
++    """Re-quantizing every token for 4K steps stays close to the fp32 state."""
++    gen = torch.Generator(device=DEV).manual_seed(4)
++    B, H, HV, steps = 4, 2, 6, 4096
++    idx = torch.arange(1, B + 1, device=DEV, dtype=torch.int32)
++    cache32 = torch.zeros((B + 1, HV, V, K), device=DEV)
++    cache16 = quantize_state_int16_ref(cache32)
++    out16 = torch.empty((B, 1, HV, V), device=DEV, dtype=torch.bfloat16)
++    out32 = torch.empty_like(out16)
++    A_log = torch.full((HV,), -4.0, device=DEV)  # slow decay: long memory
++    dt_bias = torch.zeros((HV,), device=DEV)
++    for _ in range(steps):
++        qkv = torch.randn(
++            (B, 2 * H * K + HV * V), device=DEV, dtype=torch.bfloat16, generator=gen
++        )
++        a = torch.randn((B, HV), device=DEV, dtype=torch.bfloat16, generator=gen)
++        b = torch.randn((B, HV), device=DEV, dtype=torch.bfloat16, generator=gen)
++        for st, out in ((cache16, out16), (cache32, out32)):
++            fused_recurrent_gated_delta_rule_packed_decode(
++                mixed_qkv=qkv,
++                a=a,
++                b=b,
++                A_log=A_log,
++                dt_bias=dt_bias,
++                scale=K**-0.5,
++                initial_state=st,
++                out=out,
++                ssm_state_indices=idx,
++                use_qk_l2norm_in_kernel=True,
++            )
++    s16 = dequantize_state_int16_ref(cache16[1:], V)
++    s32 = cache32[1:]
++    rel = (s16 - s32).norm(dim=(-1, -2)) / s32.norm(dim=(-1, -2))
++    assert rel.max() < 1e-3, rel.max()
++    rel_o = (out16.float() - out32.float()).norm() / out32.float().norm()
++    assert rel_o < 1e-2, rel_o
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 1a66a3fd7..5832203de 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -172,7 +172,7 @@ def is_known_kv_cache_dtype(name: str) -> bool:
+     return name in KV_CACHE_DTYPES
+ 
+ 
+-MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
++MambaDType = Literal["auto", "float32", "float16", "bfloat16", "int16"]
+ MambaCacheMode = Literal["align", "none"]
+ PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+ KVOffloadingBackend = Literal["native", "lmcache"]
+@@ -303,7 +303,9 @@ class CacheConfig:
+     mamba_ssm_cache_dtype: MambaDType = "auto"
+     """The data type to use for the Mamba cache (ssm state only, conv state will
+     still be controlled by mamba_cache_dtype). If set to 'auto', the data type
+-    for the ssm state will be determined by mamba_cache_dtype."""
++    for the ssm state will be determined by mamba_cache_dtype. 'int16'
++    (GatedDeltaNet only) stores int16 codes with one fp32 scale per state row,
++    re-quantized after every update (half the bytes of float32)."""
+     mamba_cache_mode: MambaCacheMode = "none"
+     """The cache strategy for Mamba layers, derived from `enable_prefix_caching`:
+ 
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index caf2d20f8..e19f2802c 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -63,6 +63,10 @@ from vllm.model_executor.layers.mamba.ops.gdn_recover_spec import (
+     GDNRecoverTrackers,
+     gdn_recover_verify,
+ )
++from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
++    gather_initial_states_int16,
++    scatter_states_int16,
++)
+ from vllm.model_executor.layers.mamba.ops.hip_gdn_chunk import (
+     chunk_gdn_hip_fwd,
+     is_hip_gdn_available,
+@@ -322,6 +326,18 @@ def _resolve_gdn_prefill_backend(
+     if not current_platform.is_cuda():
+         return backend, "triton"
+ 
++    if vllm_config.cache_config.mamba_ssm_cache_dtype == "int16":
++        # The int16 state is dequantized/re-quantized around the Triton chunk
++        # kernel (gather/scatter); the FlashInfer and CuteDSL prefill kernels
++        # read and write the fp32/bf16 state cache directly.
++        if backend in ("flashinfer", "cutedsl"):
++            logger.warning_once(
++                "GDN prefill backend '%s' does not support the int16 SSM state; "
++                "using Triton.",
++                backend,
++            )
++        return backend, "triton"
++
+     supports_flashinfer = False
+     supports_cutedsl = False
+ 
+@@ -699,6 +715,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             self.head_v_dim,
+             self.conv_kernel_size,
+             self.num_spec,
++            int16_state=self.cache_config.mamba_ssm_cache_dtype == "int16",
+         )
+ 
+     def __init__(
+@@ -723,6 +740,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         self.key_dim = self.head_k_dim * self.num_k_heads
+         self.value_dim = self.head_v_dim * self.num_v_heads
+         self.gqa_interleaved_layout = gqa_interleaved_layout
++        if self.cache_config.mamba_ssm_cache_dtype == "int16" and not (
++            current_platform.is_cuda()
++        ):
++            raise ValueError(
++                "--mamba-ssm-cache-dtype int16 is only implemented for the "
++                "CUDA Triton GDN kernels."
++            )
+         self.gdn_xpu_backend: str | None = None
+         self.qkvz_layout = "interleaved" if gqa_interleaved_layout else "flat"
+         if current_platform.is_xpu():
+@@ -1622,6 +1646,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         num_k_heads = self.num_k_heads // self.tp_size
+         num_v_heads = self.num_v_heads // self.tp_size
+         state_dtype = self.get_state_dtype()[1]
++        if state_dtype == torch.int16:
++            # The chunk kernel runs on the dequantized fp32 state.
++            state_dtype = torch.float32
+ 
+         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
+         # is sufficient to populate every autotuner cache. Mirror the real
+@@ -2148,9 +2175,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 )
+                 prefill_in_place = prefill_out is not None
+             else:
+-                initial_state = gather_initial_states(
+-                    ssm_state, prefill_state_indices, prefill_has_initial_state
+-                )
++                if ssm_state.dtype == torch.int16:
++                    initial_state = gather_initial_states_int16(
++                        ssm_state,
++                        prefill_state_indices,
++                        prefill_has_initial_state,
++                        self.head_v_dim,
++                    )
++                else:
++                    initial_state = gather_initial_states(
++                        ssm_state, prefill_state_indices, prefill_has_initial_state
++                    )
+                 (
+                     core_attn_out_non_spec,
+                     last_recurrent_state,
+@@ -2169,7 +2204,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                     aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
+                 )
+             # Init cache
+-            scatter_states(ssm_state, last_recurrent_state, prefill_state_indices)
++            if ssm_state.dtype == torch.int16:
++                scatter_states_int16(
++                    ssm_state, last_recurrent_state, prefill_state_indices
++                )
++            else:
++                scatter_states(ssm_state, last_recurrent_state, prefill_state_indices)
+ 
+             if split_non_spec and prefill_in_place:
+                 core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 9db714a87..504e91a42 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -134,6 +134,11 @@ class MambaStateDtypeCalculator:
+         conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+         if mamba_ssm_cache_dtype == "auto":
+             temporal_state_dtype = conv_state_dtype
++        elif mamba_ssm_cache_dtype == "int16":
++            raise ValueError(
++                "--mamba-ssm-cache-dtype int16 is only supported for GatedDeltaNet "
++                "(Qwen3-Next / Qwen3.5) layers."
++            )
+         else:
+             temporal_state_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
+ 
+@@ -156,9 +161,14 @@ class MambaStateDtypeCalculator:
+         mamba_ssm_cache_dtype: MambaDType = "auto",
+         num_spec: int = 0,
+     ) -> tuple[torch.dtype, ...]:
+-        dtypes = cls._mamba_state_dtype(
+-            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+-        )
++        if mamba_ssm_cache_dtype == "int16":
++            # int16 codes + fp32 row scales (see gdn_state_int16.py)
++            conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
++            dtypes: tuple[torch.dtype, ...] = (conv_state_dtype, torch.int16)
++        else:
++            dtypes = cls._mamba_state_dtype(
++                model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
++            )
+         if gdn_spec_recover_ring_in_page(num_spec):
+             # Record rings (u, k, g): fp32, activation dtype, fp32.
+             activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+@@ -314,6 +324,7 @@ class MambaStateShapeCalculator:
+         head_v_dim: int,
+         conv_kernel_size: int,
+         num_spec: int = 0,
++        int16_state: bool = False,
+     ):
+         conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
+         conv_state_shape = cls._orient_conv_shape(
+@@ -321,9 +332,16 @@ class MambaStateShapeCalculator:
+             conv_kernel_size - 1 + num_spec,
+         )
+ 
++        # int16 state: per head, V rows of int16 codes followed by the V fp32
++        # row scales packed into extra K-wide int16 rows (gdn_state_int16.py).
++        state_rows = (
++            head_v_dim + -(-(head_v_dim * 4) // (head_k_dim * 2))
++            if int16_state
++            else head_v_dim
++        )
+         temporal_state_shape = (
+             divide(num_v_heads, tp_world_size),
+-            head_v_dim,
++            state_rows,
+             head_k_dim,
+         )
+         if gdn_spec_recover_ring_in_page(num_spec):
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_state_int16.py b/vllm/model_executor/layers/mamba/ops/gdn_state_int16.py
+new file mode 100644
+index 000000000..6ab793825
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/ops/gdn_state_int16.py
+@@ -0,0 +1,253 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""INT16 row-scaled storage for the GatedDeltaNet recurrent state.
++
++`--mamba-ssm-cache-dtype int16` stores each per-sequence GDN state
++`[HV, V, K]` as int16 codes plus one fp32 scale per (head, v) row, packed into a
++single int16 tensor of shape `[HV, V + R, K]`: rows `0..V-1` hold the codes and
++the trailing `R = gdn_int16_scale_rows(V, K)` rows hold the `V` fp32 scales of
++that head (bit-cast). Keeping codes and scales in one dense block means every
++whole-block copy (prefix-cache "align" mode, spec-decode state moves) stays
++correct without knowing the format.
++
++Kernels compute in fp32 and re-quantize on every store:
++    scale = amax(|row|) / 32767,   code = clamp(rint(x / scale), +-32767)
++    load: x = code * scale
++This halves state traffic vs fp32 (2 + 4/K bytes per element).
++"""
++
++import torch
++
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, tldevice, triton
++
++INT16_QMAX = 32767.0
++
++
++def gdn_int16_scale_rows(head_v_dim: int, head_k_dim: int) -> int:
++    """Number of extra K-wide int16 rows per head that hold the V fp32 scales."""
++    scale_bytes = head_v_dim * 4
++    row_bytes = head_k_dim * 2
++    return -(-scale_bytes // row_bytes)
++
++
++def gdn_int16_state_rows(head_v_dim: int, head_k_dim: int) -> int:
++    return head_v_dim + gdn_int16_scale_rows(head_v_dim, head_k_dim)
++
++
++@triton.jit
++def gdn_int16_load_state(
++    p_head,  # int16 pointer to the head block [VP, K]
++    o_v,
++    o_k,
++    mask_v,
++    mask_h,
++    V: tl.constexpr,
++    K: tl.constexpr,
++):
++    """Load rows `o_v` of one head as fp32 [BV, BK]."""
++    b_code = tl.load(p_head + o_v[:, None] * K + o_k[None, :], mask=mask_h, other=0)
++    p_scale = (p_head + V * K).to(tl.pointer_type(tl.float32), bitcast=True)
++    b_scale = tl.load(p_scale + o_v, mask=mask_v, other=0.0)
++    return b_code.to(tl.float32) * b_scale[:, None]
++
++
++@triton.jit
++def gdn_int16_store_state(
++    p_head,
++    b_h,  # fp32 [BV, BK]
++    o_v,
++    o_k,
++    mask_v,
++    mask_h,
++    V: tl.constexpr,
++    K: tl.constexpr,
++):
++    """Re-quantize fp32 rows (one scale per row over K) and store them."""
++    b_amax = tl.max(tl.where(mask_h, tl.abs(b_h), 0.0), axis=1)
++    b_scale = b_amax * (1.0 / 32767.0)
++    b_inv = tl.where(b_amax > 0, 32767.0 / b_amax, 0.0)
++    b_q = tldevice.rint(b_h * b_inv[:, None])
++    b_q = tl.minimum(tl.maximum(b_q, -32767.0), 32767.0)
++    tl.store(
++        p_head + o_v[:, None] * K + o_k[None, :], b_q.to(tl.int16), mask=mask_h
++    )
++    p_scale = (p_head + V * K).to(tl.pointer_type(tl.float32), bitcast=True)
++    tl.store(p_scale + o_v, b_scale, mask=mask_v)
++
++
++# --------------------------------------------------------------------------
++# Prefill-side gather (dequantize) / scatter (quantize) of whole states.
++# --------------------------------------------------------------------------
++
++
++@triton.jit(do_not_specialize_on_alignment=["indices_ptr"])
++def _gather_int16_states_kernel(
++    state_ptr,
++    indices_ptr,
++    has_initial_state_ptr,
++    out_ptr,
++    stride_state_batch,
++    stride_indices,
++    stride_has_initial_state,
++    HV: tl.constexpr,
++    V: tl.constexpr,
++    VP: tl.constexpr,
++    K: tl.constexpr,
++    BV: tl.constexpr,
++    BK: tl.constexpr,
++):
++    i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    o_v = i_v * BV + tl.arange(0, BV)
++    o_k = tl.arange(0, BK)
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & (o_k < K)[None, :]
++    has_init = tl.load(has_initial_state_ptr + i_n * stride_has_initial_state).to(
++        tl.int1
++    )
++    p_out = out_ptr + ((i_n * HV + i_hv) * V + o_v[:, None]) * K + o_k[None, :]
++    if has_init:
++        state_idx = tl.load(indices_ptr + i_n * stride_indices).to(tl.int64)
++        p_head = state_ptr + state_idx * stride_state_batch + i_hv * VP * K
++        b_h = gdn_int16_load_state(p_head, o_v, o_k, mask_v, mask_h, V, K)
++    else:
++        b_h = tl.zeros([BV, BK], dtype=tl.float32)
++    tl.store(p_out, b_h, mask=mask_h)
++
++
++@triton.jit(do_not_specialize_on_alignment=["indices_ptr"])
++def _scatter_int16_states_kernel(
++    state_ptr,
++    src_ptr,
++    indices_ptr,
++    stride_state_batch,
++    stride_src_batch,
++    stride_indices,
++    V: tl.constexpr,
++    VP: tl.constexpr,
++    K: tl.constexpr,
++    BV: tl.constexpr,
++    BK: tl.constexpr,
++):
++    i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    o_v = i_v * BV + tl.arange(0, BV)
++    o_k = tl.arange(0, BK)
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & (o_k < K)[None, :]
++    state_idx = tl.load(indices_ptr + i_n * stride_indices).to(tl.int64)
++    p_src = (
++        src_ptr + i_n * stride_src_batch + (i_hv * V + o_v[:, None]) * K + o_k[None, :]
++    )
++    b_h = tl.load(p_src, mask=mask_h, other=0.0).to(tl.float32)
++    p_head = state_ptr + state_idx * stride_state_batch + i_hv * VP * K
++    gdn_int16_store_state(p_head, b_h, o_v, o_k, mask_v, mask_h, V, K)
++
++
++def _check_int16_state(state: torch.Tensor, head_v_dim: int) -> tuple[int, int, int]:
++    assert state.dtype == torch.int16 and state.ndim == 4
++    assert state[0].is_contiguous()
++    HV, VP, K = state.shape[1:]
++    assert VP == gdn_int16_state_rows(head_v_dim, K), (VP, head_v_dim, K)
++    return HV, VP, K
++
++
++def gather_initial_states_int16(
++    state: torch.Tensor,
++    indices: torch.Tensor,
++    has_initial_state: torch.Tensor,
++    head_v_dim: int,
++) -> torch.Tensor:
++    """fp32 `[n, HV, V, K]` initial states from an int16 GDN state cache;
++    rows without an initial state are zero."""
++    HV, VP, K = _check_int16_state(state, head_v_dim)
++    V = head_v_dim
++    assert indices.ndim == 1 and indices.shape == has_initial_state.shape
++    n = indices.numel()
++    out = torch.empty((n, HV, V, K), dtype=torch.float32, device=state.device)
++    if n == 0:
++        return out
++    BK = triton.next_power_of_2(K)
++    BV = min(triton.next_power_of_2(V), 16)
++    grid = (triton.cdiv(V, BV), HV, n)
++    _gather_int16_states_kernel[grid](
++        state,
++        indices,
++        has_initial_state,
++        out,
++        state.stride(0),
++        indices.stride(0),
++        has_initial_state.stride(0),
++        HV=HV,
++        V=V,
++        VP=VP,
++        K=K,
++        BV=BV,
++        BK=BK,
++        num_warps=4,
++    )
++    return out
++
++
++def scatter_states_int16(
++    state: torch.Tensor,
++    src: torch.Tensor,
++    indices: torch.Tensor,
++) -> None:
++    """Quantize fp32/bf16 `src [n, HV, V, K]` into the int16 cache at `indices`."""
++    V = src.shape[-2]
++    HV, VP, K = _check_int16_state(state, V)
++    assert src.shape[1:] == (HV, V, K) and src[0].is_contiguous()
++    assert indices.ndim == 1 and indices.shape[0] == src.shape[0]
++    n = indices.numel()
++    if n == 0:
++        return
++    BK = triton.next_power_of_2(K)
++    BV = min(triton.next_power_of_2(V), 16)
++    grid = (triton.cdiv(V, BV), HV, n)
++    _scatter_int16_states_kernel[grid](
++        state,
++        src,
++        indices,
++        state.stride(0),
++        src.stride(0),
++        indices.stride(0),
++        V=V,
++        VP=VP,
++        K=K,
++        BV=BV,
++        BK=BK,
++        num_warps=4,
++    )
++
++
++# --------------------------------------------------------------------------
++# Torch reference (tests, debugging).
++# --------------------------------------------------------------------------
++
++
++def quantize_state_int16_ref(x: torch.Tensor) -> torch.Tensor:
++    """fp32 `[..., HV, V, K]` -> packed int16 `[..., HV, V + R, K]`."""
++    *lead, V, K = x.shape
++    x = x.float()
++    amax = x.abs().amax(-1, keepdim=True)
++    scale = amax / INT16_QMAX
++    inv = torch.where(amax > 0, INT16_QMAX / amax, torch.zeros_like(amax))
++    code = torch.round(x * inv).clamp_(-INT16_QMAX, INT16_QMAX).to(torch.int16)
++    R = gdn_int16_scale_rows(V, K)
++    tail = torch.zeros((*lead, R * K // 2), dtype=torch.float32, device=x.device)
++    tail[..., :V] = scale.squeeze(-1)
++    tail = tail.view(torch.int16).reshape(*lead, R, K)
++    return torch.cat([code, tail], dim=-2)
++
++
++def dequantize_state_int16_ref(s: torch.Tensor, head_v_dim: int) -> torch.Tensor:
++    """packed int16 `[..., HV, V + R, K]` -> fp32 `[..., HV, V, K]`."""
++    V = head_v_dim
++    K = s.shape[-1]
++    code = s[..., :V, :].float()
++    scale = s[..., V:, :].contiguous().view(torch.float32).flatten(-2)[..., :V]
++    return code * scale.unsqueeze(-1)
++
++
++def is_int16_state_supported() -> bool:
++    return current_platform.is_cuda_alike()
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index b45d50692..e2da8f2f8 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -414,6 +414,7 @@ class Qwen3_5ForCausalLMBase(
+             hf_config.linear_value_head_dim,
+             hf_config.linear_conv_kernel_dim,
+             num_spec,
++            int16_state=vllm_config.cache_config.mamba_ssm_cache_dtype == "int16",
+         )
+ 
+     @classmethod
+@@ -636,6 +637,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+             hf_config.linear_value_head_dim,
+             hf_config.linear_conv_kernel_dim,
+             num_spec,
++            int16_state=vllm_config.cache_config.mamba_ssm_cache_dtype == "int16",
+         )
+ 
+     @classmethod
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index c09d1ec1b..66e3fc37f 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -935,6 +935,7 @@ class Qwen3NextForCausalLM(
+             hf_config.linear_value_head_dim,
+             hf_config.linear_conv_kernel_dim,
+             num_spec,
++            int16_state=vllm_config.cache_config.mamba_ssm_cache_dtype == "int16",
+         )
+ 
+     @classmethod
+diff --git a/vllm/model_executor/warmup/qwen_triton_warmup.py b/vllm/model_executor/warmup/qwen_triton_warmup.py
+index a6aea7592..95843061c 100644
+--- a/vllm/model_executor/warmup/qwen_triton_warmup.py
++++ b/vllm/model_executor/warmup/qwen_triton_warmup.py
+@@ -368,6 +368,9 @@ def _warm_state_gather_scatter_kernels(
+         scatter_states,
+     )
+ 
++    if config.state_dtype == torch.int16:
++        _warm_int16_state_gather_scatter_kernels(device, config)
++        return
+     state = torch.zeros(
+         2, config.hv, config.v, config.k, dtype=config.state_dtype, device=device
+     )
+@@ -384,6 +387,37 @@ def _warm_state_gather_scatter_kernels(
+         scatter_states(state, gathered, idx)
+ 
+ 
++def _warm_int16_state_gather_scatter_kernels(
++    device: torch.device, config: "_QwenGDNWarmupConfig"
++) -> None:
++    """int16 GDN state: the prefill path dequantizes/quantizes around the
++    Triton chunk kernel instead of the plain gather/scatter."""
++    from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
++        gather_initial_states_int16,
++        gdn_int16_state_rows,
++        scatter_states_int16,
++    )
++
++    state = torch.zeros(
++        2,
++        config.hv,
++        gdn_int16_state_rows(config.v, config.k),
++        config.k,
++        dtype=torch.int16,
++        device=device,
++    )
++    idx_pool = torch.zeros(6, dtype=torch.int32, device=device)
++    has_pool = torch.zeros(2, dtype=torch.bool, device=device)
++    for idx, has in (
++        (idx_pool[:1], has_pool[:1]),
++        (idx_pool[1:2], has_pool[1:2]),
++        (idx_pool[4:5], has_pool[1:2]),
++        (idx_pool[::2][:1], has_pool[:1]),
++    ):
++        gathered = gather_initial_states_int16(state, idx, has, config.v)
++        scatter_states_int16(state, gathered, idx)
++
++
+ def _synchronize_device(device: torch.device) -> None:
+     if device.type == "cuda":
+         torch.accelerator.synchronize(device)
+diff --git a/vllm/models/qwen3_5/nvidia/model.py b/vllm/models/qwen3_5/nvidia/model.py
+index 9ab576d09..b7e5318f0 100644
+--- a/vllm/models/qwen3_5/nvidia/model.py
++++ b/vllm/models/qwen3_5/nvidia/model.py
+@@ -761,6 +761,7 @@ class Qwen3_5ForCausalLMBase(
+             hf_config.linear_value_head_dim,
+             hf_config.linear_conv_kernel_dim,
+             num_spec,
++            int16_state=vllm_config.cache_config.mamba_ssm_cache_dtype == "int16",
+         )
+ 
+     @classmethod
+@@ -966,6 +967,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+             hf_config.linear_value_head_dim,
+             hf_config.linear_conv_kernel_dim,
+             num_spec,
++            int16_state=vllm_config.cache_config.mamba_ssm_cache_dtype == "int16",
+         )
+ 
+     @classmethod
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+index 7de8e40c2..b3a44ee3e 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+@@ -11,6 +11,11 @@
+ import torch
+ 
+ from vllm.platforms import current_platform
++from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
++    gdn_int16_load_state,
++    gdn_int16_state_rows,
++    gdn_int16_store_state,
++)
+ from vllm.triton_utils import tl, triton
+ 
+ from .op import exp, log
+@@ -280,6 +285,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+     SOFTPLUS_THRESHOLD: tl.constexpr,
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+     SPLIT_BATCH_HEAD_GRID: tl.constexpr,
++    STATE_INT16: tl.constexpr = False,
++    VP: tl.constexpr = 0,
+ ):
+     if SPLIT_BATCH_HEAD_GRID:
+         i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+@@ -303,9 +310,14 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+         tl.store(p_o, zero, mask=mask_v)
+         return
+ 
+-    p_h0 = h0 + state_idx * stride_init_state_token
+-    p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+-    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
++    if STATE_INT16:
++        # int16 codes [V, K] + fp32 row scales packed per head as [VP, K]
++        p_h0 = h0 + state_idx * stride_init_state_token + i_hv * VP * K
++        b_h = gdn_int16_load_state(p_h0, o_v, o_k, mask_v, mask_h, V, K)
++    else:
++        p_h0 = h0 + state_idx * stride_init_state_token
++        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
++        b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+ 
+     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
+     q_off = i_h * K + o_k
+@@ -336,9 +348,13 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
+     b_o = tl.sum(b_h * b_q[None, :], 1)
+     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+ 
+-    p_ht = ht + state_idx * stride_final_state_token
+-    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+-    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
++    if STATE_INT16:
++        p_ht = ht + state_idx * stride_final_state_token + i_hv * VP * K
++        gdn_int16_store_state(p_ht, b_h, o_v, o_k, mask_v, mask_h, V, K)
++    else:
++        p_ht = ht + state_idx * stride_final_state_token
++        p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
++        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+ 
+ 
+ def fused_recurrent_gated_delta_rule_packed_decode(
+@@ -405,7 +421,15 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+         )
+     if initial_state.stride(-1) != 1:
+         raise ValueError("`initial_state` must be contiguous in the last dim.")
+-    HV, V, K = initial_state.shape[-3:]
++    HV, VP, K = initial_state.shape[-3:]
++    state_int16 = initial_state.dtype == torch.int16
++    # An int16 state packs [V codes + scale rows] per head; V comes from `out`.
++    V = out.shape[-1] if state_int16 else VP
++    if state_int16 and VP != gdn_int16_state_rows(V, K):
++        raise ValueError(
++            f"int16 state must have {gdn_int16_state_rows(V, K)} rows per head "
++            f"(got {VP})."
++        )
+     if a.shape[1] != HV or b.shape[1] != HV:
+         raise ValueError(
+             f"`a`/`b` must have shape [B, HV] with HV={HV} (got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)})."
+@@ -449,7 +473,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+         # MRv2 decode warmup/graph capture compiles the reachable BV variants.
+         if B * HV <= 64:
+             BV = 4
+-        elif initial_state.dtype == torch.float32:
++        elif initial_state.dtype in (torch.float32, torch.int16):
+             BV = 8
+     elif (
+         K == V == 128
+@@ -500,6 +524,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+         SOFTPLUS_THRESHOLD=20.0,
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+         SPLIT_BATCH_HEAD_GRID=split_batch_head_grid,
++        STATE_INT16=state_int16,
++        VP=VP,
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+index 7e0c7e05c..97567a856 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+@@ -9,6 +9,11 @@
+ 
+ import torch
+ 
++from vllm.model_executor.layers.mamba.ops.gdn_state_int16 import (
++    gdn_int16_load_state,
++    gdn_int16_state_rows,
++    gdn_int16_store_state,
++)
+ from vllm.triton_utils import tl, triton
+ 
+ 
+@@ -58,7 +63,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+     IS_CONTINUOUS_BATCHING: tl.constexpr,
+     IS_SPEC_DECODING: tl.constexpr,
+     IS_KDA: tl.constexpr,
++    STATE_INT16: tl.constexpr = False,
++    VP: tl.constexpr = 0,
+ ):
++    # STATE_INT16: per-head state is int16 codes [V, K] + fp32 row scales,
++    # packed as [VP, K] (see gdn_state_int16.py); NK must be 1.
+     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+     i_n, i_hv = i_nh // HV, i_nh % HV
+     i_h = i_hv // (HV // H)
+@@ -114,10 +123,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+             if state_idx <= 0:
+                 return
+             p_h0 = h0 + state_idx * stride_init_state_token
++        elif STATE_INT16:
++            p_h0 = h0 + bos * HV * VP * K
+         else:
+             p_h0 = h0 + bos * HV * V * K
+-        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+-        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
++        if STATE_INT16:
++            b_h += gdn_int16_load_state(
++                p_h0 + i_hv * VP * K, o_v, o_k, mask_v, mask_h, V, K
++            )
++        else:
++            p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
++            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+ 
+     for i_t in range(0, T):
+         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+@@ -162,12 +178,22 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+             # Only store if state index is valid (not NULL_BLOCK_ID=0)
+             if final_state_idx > 0:
+                 p_ht = ht + final_state_idx * stride_final_state_token
+-                p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+-                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
++                if STATE_INT16:
++                    gdn_int16_store_state(
++                        p_ht + i_hv * VP * K, b_h, o_v, o_k, mask_v, mask_h, V, K
++                    )
++                else:
++                    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
++                    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+         else:
+             p_ht = ht + (bos + i_t) * stride_final_state_token
+-            p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+-            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
++            if STATE_INT16:
++                gdn_int16_store_state(
++                    p_ht + i_hv * VP * K, b_h, o_v, o_k, mask_v, mask_h, V, K
++                )
++            else:
++                p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
++                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+ 
+         # Update pointers for next timestep
+         p_q += H * K
+@@ -222,11 +248,16 @@ def fused_sigmoid_gating_delta_rule_update(
+     else:
+         assert scale > 0, "scale must be positive"
+ 
++    state_int16 = initial_state is not None and initial_state.dtype == torch.int16
++    VP = gdn_int16_state_rows(V, K) if state_int16 else V
++    if state_int16:
++        assert not is_kda, "int16 GDN state is not supported for KDA"
++        assert initial_state.stride(0) % 2 == 0
+     o = q.new_empty(NK, *v.shape)
+     if inplace_final_state:
+         final_state = initial_state
+     else:
+-        final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
++        final_state = q.new_empty(T, HV, VP, K, dtype=initial_state.dtype)
+ 
+     stride_init_state_token = initial_state.stride(0)
+     stride_final_state_token = final_state.stride(0)
+@@ -272,6 +303,8 @@ def fused_sigmoid_gating_delta_rule_update(
+         INPLACE_FINAL_STATE=inplace_final_state,
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+         IS_KDA=is_kda,
++        STATE_INT16=state_int16,
++        VP=VP,
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index 0f776a0cf..634356ccd 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -48,6 +48,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
+     "fp8_e4m3": torch.uint8,
+     "fp8_e5m2": torch.uint8,
+     "int8": torch.int8,
++    "int16": torch.int16,
+     "int4_per_token_head": torch.uint8,
+     "int8_per_token_head": torch.int8,
+     "fp8_per_token_head": torch.uint8,

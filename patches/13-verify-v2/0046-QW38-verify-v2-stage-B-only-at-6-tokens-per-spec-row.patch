@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:49:18 -0800
+Subject: [PATCH] [QW38] verify v2: stage B only at >= 6 tokens per spec row
+ (VLLM_GDN_VERIFY_V2B_MIN_T)
+
+Stage B pads each request to BT >= 8 key rows; its cost barely depends on T.
+Fold microbench vs the shipped fold verify: T=8 -13..-19%, T=4 +9..+47%,
+T=2 +37..+105% (N 1..128). RTX PRO 6000 D3 e2e (MTP k3/k1, T=4/2) with B everywhere:
+1K c16 -1.9%, c64/c128 -8.9% tok/s/GPU. Env-driven dispatch now uses the
+shipped verify when token rows / spec rows < 6 (host ints, fixed per captured
+graph), with a one-time info line. The latency profile (DFlash2 k7, T=8) keeps B.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/mamba/ops/gdn_recover_spec.py      | 26 ++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index 35ef34820..2a3a0d3b7 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -81,6 +81,28 @@ _V2B_BV = int(os.environ.get("VLLM_GDN_VERIFY_V2_BV", "64"))
+ _V2B_WARPS = int(os.environ.get("VLLM_GDN_VERIFY_V2_WARPS", "4"))
+ _V2B_PREC = os.environ.get("VLLM_GDN_VERIFY_V2_PREC", "split")
+ _V2B_MIN_N = int(os.environ.get("VLLM_GDN_VERIFY_V2B_MIN_N", "1"))
++# Stage B pads each request to BT >= 8 key rows, so its cost barely depends on the
++# tokens per request: -13..-19% vs ship at T = 8, +9..+47% at T = 4, +37..+105% at
++# T = 2 (fold microbench). Average tokens per spec row (token rows / spec rows,
++# fixed per captured graph) below this -> shipped verify.
++_V2B_MIN_T = float(os.environ.get("VLLM_GDN_VERIFY_V2B_MIN_T", "6"))
++_v2b_lowt_logged = False
++
++
++def _v2b_t_ok(T: int, N: int) -> bool:
++    global _v2b_lowt_logged
++    ok = T >= _V2B_MIN_T * N
++    if not ok and not _v2b_lowt_logged:
++        _v2b_lowt_logged = True
++        from vllm.logger import init_logger
++
++        init_logger(__name__).info(
++            "GDN recover verify v2 (QW38 verify-v2): %.1f tokens per spec row < %.1f; "
++            "stage B is skipped for such batches (shipped verify)",
++            T / max(N, 1),
++            _V2B_MIN_T,
++        )
++    return ok
+ # State rows per fold sub-tile (the pending-record replay + requantized store).
+ _V2B_SBV = int(os.environ.get("VLLM_GDN_VERIFY_V2_SBV", "64"))
+ _v2_logged: set = set()
+@@ -969,7 +991,9 @@ def gdn_recover_verify(
+     else:
+         req_indices = defer_half = defer_pending = slot_indices
+     mode = _VERIFY_V2 if verify_v2 is None else verify_v2
+-    if verify_v2 is None and mode == "B" and (window != 1 or N < _V2B_MIN_N):
++    if verify_v2 is None and mode == "B" and (
++        window != 1 or N < _V2B_MIN_N or not _v2b_t_ok(T, N)
++    ):
+         mode = "0"
+     if mode == "A":
+         _log_v2_once("A", defer is not None)

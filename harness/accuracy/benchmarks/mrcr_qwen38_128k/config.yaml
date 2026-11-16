@@ -1,0 +1,34 @@
+# MRCR (openai/mrcr), Qwen3.8 tokenizer, conversations <= 131072 tokens (long-context check).
+# Same data + grading as Gym's benchmarks/mrcr (SequenceMatcher ratio, gated on the random prefix);
+# data built on a CPU host with network access with:
+#   PYTHONPATH=<extra deps dir> Gym/.venv/bin/python Gym/benchmarks/mrcr/prepare.py \
+#     --tokenizer_name <tokenizer dir, e.g. nvidia/Qwen3.8-27B-NVFP4> --max_context_tokens 131072 --output_fpath <data jsonl>
+# jsonl_fpath is repo-relative; run_gym.sh makes it absolute in the run copy it generates.
+config_paths:
+  - resources_servers/mrcr/configs/mrcr.yaml
+
+mrcr_qwen38_128k_benchmark_resources_server:
+  _inherit_from: mrcr_resources_server
+
+mrcr_qwen38_128k_benchmark_simple_agent:
+  _inherit_from: mrcr_simple_agent
+  responses_api_agents:
+    simple_agent:
+      max_steps: 1
+      resources_server:
+        name: mrcr_qwen38_128k_benchmark_resources_server
+      datasets:
+      - name: mrcr_qwen38_128k
+        type: benchmark
+        jsonl_fpath: harness/accuracy/benchmarks/mrcr_qwen38_128k/data/mrcr_qwen38_128k_benchmark.jsonl
+        prompt_config: null
+        # Required by Gym's schema; the data is pre-built (see header).
+        prepare_script: benchmarks/mrcr/prepare.py
+        num_repeats: 1
+
+mrcr_qwen38_128k_benchmark_environment_server:
+  _inherit_from: mrcr_environment_server
+  environment_servers:
+    legacy_agent:
+      agent_server:
+        name: mrcr_qwen38_128k_benchmark_simple_agent

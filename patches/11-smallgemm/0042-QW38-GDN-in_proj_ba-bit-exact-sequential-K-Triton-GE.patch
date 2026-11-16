@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 01:52:22 -0800
+Subject: [PATCH] [QW38] GDN in_proj_ba: bit-exact sequential-K Triton GEMM for
+ M=2..4 on SM120
+
+cuBLAS picks cutlass_80_wmma 16x16 (8 single-warp CTAs, ~34 us cold, ~52 us in
+serving) for in_proj_ba (N=96, K=5120) at M=2..4, i.e. MTP k=3 decode at one
+request. The Triton kernel runs the same sequential k16 HMMA chain (no split-K),
+bit-identical to that kernel on SM120, at ~9 us. Other M and other archs keep
+cuBLAS. VLLM_GDN_BA_SEQK=0 disables it; one-time proof log line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/mamba/gdn/ba_proj_small_m.py       | 97 +++++++++++++++++++
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  | 22 ++++-
+ 2 files changed, 117 insertions(+), 2 deletions(-)
+ create mode 100644 vllm/model_executor/layers/mamba/gdn/ba_proj_small_m.py
+
+diff --git a/vllm/model_executor/layers/mamba/gdn/ba_proj_small_m.py b/vllm/model_executor/layers/mamba/gdn/ba_proj_small_m.py
+new file mode 100644
+index 000000000..10d3aac61
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/ba_proj_small_m.py
+@@ -0,0 +1,97 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""[QW38 smallgemm] Small-M path for the GDN in_proj_ba GEMM (bf16, N = 2 * num_v_heads).
++
++On SM120 with M = 2..4 tokens (MTP k=3 decode at one request), cuBLAS picks
++`cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2`: 8 single-warp CTAs
++walking K serially, ~34 us cold (~52 us in serving) for a ~1 MB weight. This kernel
++runs the same sequential k16 bf16 HMMA chain with fp32 accumulation (no split-K)
++and is bit-identical to that cuBLAS kernel at M = 2..4 (verified on SM120), at
++~9 us. Other M keep cuBLAS: M = 1 (gemv) and M >= 5 (split-K) reduce in a
++different order, so this kernel would not be exact there.
++Disable with VLLM_GDN_BA_SEQK=0.
++"""
++
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++
++logger = init_logger(__name__)
++
++_BK = 512
++_ENABLED = os.environ.get("VLLM_GDN_BA_SEQK", "1") != "0"
++_logged = False
++_sm120: bool | None = None
++
++
++def _is_sm120() -> bool:
++    # Verified bit-exact on SM120 only (cuBLAS kernel choice is per arch).
++    global _sm120
++    if _sm120 is None:
++        _sm120 = current_platform.is_cuda() and torch.cuda.get_device_capability() == (12, 0)
++    return _sm120
++
++
++@triton.jit
++def _ba_seqk_kernel(
++    x_ptr, w_ptr, o_ptr, M, N, K, sxm, swn, som,
++    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++):
++    # out^T tile [BN, BM] = W[BN, K] @ x[BM, K]^T, K walked in order (one acc chain).
++    pid_n = tl.program_id(0)
++    rm = tl.arange(0, BM)
++    rn = pid_n * BN + tl.arange(0, BN)
++    rk = tl.arange(0, BK)
++    xp = x_ptr + rm[:, None] * sxm + rk[None, :]
++    wp = w_ptr + rn[:, None] * swn + rk[None, :]
++    mm = rm[:, None] < M
++    mn = rn[:, None] < N
++    acc = tl.zeros((BN, BM), tl.float32)
++    for k0 in range(0, K, BK):
++        x = tl.load(xp + k0, mask=mm, other=0.0)
++        w = tl.load(wp + k0, mask=mn, other=0.0)
++        acc = tl.dot(w, tl.trans(x), acc)
++    tl.store(
++        o_ptr + rm[None, :] * som + rn[:, None],
++        acc.to(tl.bfloat16),
++        mask=(rm[None, :] < M) & (rn[:, None] < N),
++    )
++
++
++def ba_seqk_applicable(x: torch.Tensor, weight: torch.Tensor) -> bool:
++    return (
++        _ENABLED
++        and x.dim() == 2
++        and 2 <= x.shape[0] <= 4
++        and x.dtype == torch.bfloat16
++        and weight.dtype == torch.bfloat16
++        and x.is_cuda
++        and x.stride(1) == 1
++        and weight.stride(1) == 1
++        and x.shape[1] == weight.shape[1]
++        and weight.shape[1] % _BK == 0
++        and _is_sm120()
++    )
++
++
++def ba_seqk_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    global _logged
++    if not _logged:
++        _logged = True
++        logger.info(
++            "QW38 smallgemm: GDN in_proj_ba M=2..4 -> sequential-K Triton GEMM "
++            "(bit-exact vs cuBLAS wmma 16x16; N=%d K=%d).",
++            weight.shape[0], weight.shape[1],
++        )
++    M, K = x.shape
++    N = weight.shape[0]
++    out = torch.empty((M, N), dtype=x.dtype, device=x.device)
++    _ba_seqk_kernel[(triton.cdiv(N, 16),)](
++        x, weight, out, M, N, K, x.stride(0), weight.stride(0), out.stride(0),
++        BM=8, BN=16, BK=_BK, num_warps=1, num_stages=4,
++    )
++    return out
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 3b48dc1b4..bebcc2bbd 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -100,6 +100,10 @@ from vllm.third_party.flash_linear_attention.ops.fused_gdn_decode_post_conv_mtp
+ )
+ from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+ from vllm.utils.math_utils import cdiv
++from vllm.model_executor.layers.mamba.gdn.ba_proj_small_m import (
++    ba_seqk_applicable,
++    ba_seqk_gemm,
++)
+ from vllm.utils.multi_stream_utils import execute_in_parallel
+ from vllm.utils.torch_utils import (
+     LayerNameType,
+@@ -805,6 +809,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # FlashInfer GEMMs share a process-wide workspace. Off with ubatching and LoRA.
+         self._ba_stream = None
+         ba_method = self.in_proj_ba.quant_method
++        # [QW38 smallgemm] bit-exact small-M (2..4) in_proj_ba path on SM120.
++        self._ba_seqk = (
++            current_platform.is_cuda()
++            and isinstance(ba_method, UnquantizedLinearMethod)
++            and ba_method._gemm_impl is cuda_unquantized_gemm
++            and self.in_proj_ba.bias is None
++            and vllm_config.lora_config is None
++        )
+         if (
+             overlap_ba_proj
+             and current_platform.is_cuda()
+@@ -1408,6 +1420,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         else:
+             return self.forward_cuda(hidden_states)
+ 
++    def _in_proj_ba(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        weight = self.in_proj_ba.weight
++        if self._ba_seqk and ba_seqk_applicable(hidden_states, weight):
++            return ba_seqk_gemm(hidden_states, weight)
++        return self.in_proj_ba(hidden_states)[0]
++
+     def forward_cuda(
+         self,
+         hidden_states: torch.Tensor,
+@@ -1428,7 +1446,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         qkvz_in = hidden_states if qkvz_input is None else qkvz_input
+         if self._ba_stream is None:
+             mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
+-            ba, _ = self.in_proj_ba(hidden_states)
++            ba = self._in_proj_ba(hidden_states)
+         else:
+             # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
+             # capture: eagerly the stream switch costs more host time than it
+@@ -1437,7 +1455,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             start, done = self._ba_events
+             mixed_qkvz, (ba,) = execute_in_parallel(
+                 lambda: self.in_proj_qkvz(qkvz_in)[0],
+-                [lambda: self.in_proj_ba(hidden_states)[0]],
++                [lambda: self._in_proj_ba(hidden_states)],
+                 start,
+                 [done],
+                 [self._ba_stream],

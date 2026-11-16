@@ -1,0 +1,19 @@
+Qwen3.8-27B-NVFP4-LC32K
+Copyright 2026 Frida Hou
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This model is a quantized derivative of Qwen/Qwen3.8-27B (https://huggingface.co/Qwen/Qwen3.8-27B, revision 37561816,
+Apache-2.0, Copyright Alibaba Cloud). All weights and scales are computed from the BF16 base; the published
+nvidia/Qwen3.8-27B-NVFP4 checkpoint (Apache-2.0) was used only as a file-layout scaffold for the MTP head.
+
+Quantized with NVIDIA Model Optimizer (https://github.com/NVIDIA/Model-Optimizer, Apache-2.0).
+
+Calibration data (not included; each source keeps its own license, as declared on its page):
+- deepmind/pg19 (Apache-2.0)
+- princeton-nlp/prolong-data-64K, The Stack v1 and textbooks subsets (no license declared; The Stack v1 terms apply)
+- nvidia/Nemotron-SFT-Instruction-Following-Chat-v2 (ODC-By), via synthetic recall chats
+- nebius/SWE-rebench-openhands-trajectories (CC-BY-4.0)
+- nvidia/Nemotron-Post-Training-Dataset-v3 (lm_head and MTP head calibration)
+
+Serving code, recipes and the evaluation harness: https://github.com/Frida-a/Qwen3.8-27B-NVFP4-SingleGPU-Serving

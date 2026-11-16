@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:43:02 -0800
+Subject: [PATCH] [Kernel] K8V4 decode: split heuristic from the SM120 sweep
+
+splits = clamp(ceil(4 * SMs / (reqs * kv_heads)), 1, 96) (was 2 * SMs, cap 64).
+RTX PRO 6000 kernel sweep (same-process XQA fp8 A/B): with the per-cell best config
+K8V4 is 1.00-1.23x XQA at 32K/128K and 1.59-1.72x at 1K c=1 (0.87x at 1K
+c=16); the old auto split lost 10-17% at 32K c=1 / c=16 and 128K c=16.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/ops/k8v4_kv.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/v1/attention/ops/k8v4_kv.py b/vllm/v1/attention/ops/k8v4_kv.py
+index 1c3cb8b5f..de5277b38 100644
+--- a/vllm/v1/attention/ops/k8v4_kv.py
++++ b/vllm/v1/attention/ops/k8v4_kv.py
+@@ -458,8 +458,10 @@ def k8v4_num_splits(num_reqs: int, num_kv_heads: int, device: torch.device) -> i
+     env = os.environ.get("VLLM_K8V4_DECODE_SPLITS")
+     if env:
+         return max(1, int(env))
+-    target = 2 * _num_sms(device)
+-    return max(1, min(64, triton.cdiv(target, max(1, num_reqs * num_kv_heads))))
++    # SM120 kernel sweep: ~4 CTAs per SM, capped at 96, is within
++    # ~10% of the per-cell best at c = 1 / 16 / 64 and 1K-128K context.
++    target = 4 * _num_sms(device)
++    return max(1, min(96, triton.cdiv(target, max(1, num_reqs * num_kv_heads))))
+ 
+ 
+ def k8v4_decode(

@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:14:45 -0800
+Subject: [PATCH] [QW38] gdn recover fold: fold (not drop) pending records of
+ non-spec rows, in every cache group
+
+Prefill / non-spec rows read their state with the prefill kernels, not the
+fold verify. 0037 dropped any records still pending in their
+request-table rows, and only in the first cache group's builder (groups
+built through update_block_table kept them). Now every group folds them into
+the row's running slot first (GDNRecoverCommitGroup.flush_deferred, same
+commit kernel as the forced fold) and clears them. Unreachable on the shipped
+align-mode config (a request with pending records never becomes a non-spec
+row); hardening only. VLLM_GDN_RECOVER_FOLD_DEBUG=1 counts folds that found
+pending records (logs every 50th call, syncs).
+
+Tests: prefill-row case (int16/fp32 x align) + negative control (drop must
+fail).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/mamba/test_gdn_recover_fold.py  |  50 ++++++++-
+ .../layers/mamba/ops/gdn_recover_spec.py      |  65 +++++++++++
+ vllm/v1/attention/backends/gdn_attn.py        | 106 +++++++++++++++---
+ 3 files changed, 206 insertions(+), 15 deletions(-)
+
+diff --git a/tests/kernels/mamba/test_gdn_recover_fold.py b/tests/kernels/mamba/test_gdn_recover_fold.py
+index 2f7fecf6c..4a88b07f4 100644
+--- a/tests/kernels/mamba/test_gdn_recover_fold.py
++++ b/tests/kernels/mamba/test_gdn_recover_fold.py
+@@ -75,12 +75,18 @@ class _Req:
+ 
+ 
+ class _Sim:
+-    def __init__(self, fmt, graph, align, mixed, seed, reset=True, stale_read=False):
++    def __init__(self, fmt, graph, align, mixed, seed, reset=True, stale_read=False,
++                 prefill_flush=None):
+         self.fmt, self.graph, self.align, self.mixed = fmt, graph, align, mixed
+         self.reset = reset
+         # Negative control: the fold path verifies one request off a poisoned
+         # (never written) block, as a read-before-store bug would.
+         self.stale_read = stale_read
++        # A request with pending records turns into a non-spec (prefill) row:
++        # "fold" = the builder's flush_deferred (must match the eager commit),
++        # "drop" = 5414a0131's reset of those rows (negative control).
++        self.prefill_flush = prefill_flush
++        self.flush_counter = torch.zeros(2, dtype=torch.int64, device=DEV)
+         self.rng = random.Random(seed)
+         self.gen = torch.Generator(device=DEV).manual_seed(seed)
+         grs._DEFER_TRACKERS.clear()
+@@ -187,6 +193,23 @@ class _Sim:
+             else:
+                 s[b].fill_(float("nan"))
+ 
++    def _prefill_row(self, r):
++        """The request runs as a non-spec row this step: its state is read by
++        the prefill kernels, so the fold path must first fold its pending
++        records (the reference has none). Then the prefill writes a new state."""
++        slots = torch.tensor([r.run_slot], dtype=torch.int32, device=DEV)
++        rows = torch.tensor([r.row], dtype=torch.int32, device=DEV)
++        if self.prefill_flush == "fold":
++            self.fold_group.flush_deferred(slots, rows, counter=self.flush_counter)
++        else:
++            self.defer.reset(rows)
++        torch.cuda.synchronize()
++        assert int(self.defer.pending[r.row]) == 0
++        for i in range(L):
++            _eq(self.fold_states[i][r.run_slot], self.ref_states[i][r.run_slot],
++                f"layer {i} slot {r.run_slot} state read by a prefill row")
++        self._prefill_state(r.run_slot)
++
+     # ---- graph mode ------------------------------------------------------------
+     def _init_graph(self):
+         T_max = N_PAD * (NUM_SPEC + 1)
+@@ -243,6 +266,8 @@ class _Sim:
+         while len(self.reqs) < 3 or (self.free_rows and rng.random() < 0.3):
+             if self.admit() is None:
+                 break
++        if self.prefill_flush and self.reqs and rng.random() < 0.35:
++            self._prefill_row(rng.choice(list(self.reqs.values())))
+         # Batch: a random subset in random order (others skip this step).
+         live = list(self.reqs.values())
+         rng.shuffle(live)
+@@ -421,3 +446,26 @@ def test_recover_fold_crossings_exercised():
+         sim.step()
+         n = max(n, sum(len(r.crossed) for r in sim.reqs.values()))
+     assert n >= 3
++
++
++@pytest.mark.parametrize("fmt", ["int16_row", "fp32"])
++@pytest.mark.parametrize("align", [False, True])
++def test_recover_fold_prefill_row_folds_pending(fmt, align):
++    """A request with pending records that becomes a non-spec (prefill) row:
++    the builder's flush_deferred folds them into its state first, so the
++    prefill reads exactly the eager commit's state."""
++    seed = zlib.crc32(f"prefill{fmt}{align}".encode())
++    sim = _Sim(fmt, False, align, True, seed=seed, prefill_flush="fold")
++    for _ in range(60):
++        sim.step()
++    rows, records = sim.flush_counter.tolist()
++    assert rows >= 5 and records >= rows, (rows, records)  # really exercised
++
++
++def test_recover_fold_detects_prefill_row_drop():
++    """Negative control: dropping the pending records (5414a0131's reset of
++    non-spec rows) instead of folding them must fail the gate."""
++    sim = _Sim("int16_row", False, False, True, seed=5, prefill_flush="drop")
++    with pytest.raises(AssertionError):
++        for _ in range(60):
++            sim.step()
+diff --git a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+index 9ba787927..038f6bac4 100644
+--- a/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
++++ b/vllm/model_executor/layers/mamba/ops/gdn_recover_spec.py
+@@ -889,6 +889,43 @@ def _gdn_recover_defer_plan_kernel(
+     tl.store(defer_pending + req, tl.where(forced, 0, n_acc), mask=valid)
+ 
+ 
++@triton.heuristics({"COUNT": lambda args: args["counter"] is not None})
++@triton.jit
++def _gdn_recover_defer_flush_plan_kernel(
++    slot_indices,
++    req_indices,
++    defer_half,
++    defer_pending,
++    plan,
++    counter,
++    HALF: tl.constexpr,
++    COUNT: tl.constexpr,
++):
++    """Deferred commit, before a non-spec (prefill) row reads its state: fold
++    the records still pending in its request-table row into its running slot
++    (plan count > 0) and clear them. Rows without a slot only clear them.
++
++    plan[n] = (src, dst, start, count, 0, 0, rec, 0)."""
++    i_n = tl.program_id(0)
++    p_plan = plan + i_n * 8
++    slot = tl.load(slot_indices + i_n).to(tl.int32)
++    req = tl.load(req_indices + i_n).to(tl.int64)
++    pending = tl.load(defer_pending + req)
++    count = tl.where(slot > 0, pending, 0)
++    tl.store(p_plan + 0, slot)
++    tl.store(p_plan + 1, slot)
++    tl.store(p_plan + 2, tl.load(defer_half + req) * HALF)
++    tl.store(p_plan + 3, count)
++    tl.store(p_plan + 4, 0)
++    tl.store(p_plan + 5, 0)
++    tl.store(p_plan + 6, req.to(tl.int32))
++    tl.store(p_plan + 7, 0)
++    tl.store(defer_pending + req, 0)
++    if COUNT:
++        tl.atomic_add(counter + 0, (count > 0).to(tl.int64))
++        tl.atomic_add(counter + 1, count.to(tl.int64))
++
++
+ @triton.jit
+ def _gdn_recover_commit_kernel(
+     state_addrs,
+@@ -1166,6 +1203,34 @@ class GDNRecoverCommitGroup:
+             # Only crossing rows have a nonzero count; the others exit early.
+             self._launch_commit(plan, N)
+ 
++    def flush_deferred(
++        self,
++        slot_indices: torch.Tensor,
++        req_indices: torch.Tensor,
++        counter: torch.Tensor | None = None,
++    ) -> None:
++        """Deferred commit (VLLM_GDN_RECOVER_FOLD=1): before rows that do not
++        run the fold verify (prefill / non-spec rows) read their state, fold
++        the records pending in their request-table rows `req_indices[n]` into
++        `slot_indices[n]` and clear them. A no-op for rows with nothing
++        pending. counter (int64[2], optional): += (rows folded, records)."""
++        assert self.defer is not None
++        N = slot_indices.shape[0]
++        if N == 0:
++            return
++        plan = self._plan_buffer(N)
++        _gdn_recover_defer_flush_plan_kernel[(N,)](
++            slot_indices.contiguous(),
++            req_indices.contiguous(),
++            self.defer.half,
++            self.defer.pending,
++            plan,
++            counter,
++            HALF=self.records[0].half,
++            num_warps=1,
++        )
++        self._launch_commit(plan, N)
++
+     def commit(
+         self,
+         slot_indices: torch.Tensor,
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 9f5d345ee..e5ec3e555 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -3,6 +3,7 @@
+ """Backend for GatedDeltaNet attention."""
+ 
+ import math
++import os
+ from dataclasses import dataclass, replace
+ from typing import Any, Literal
+ 
+@@ -11,6 +12,7 @@ import torch
+ 
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.config import VllmConfig
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.mamba.checkpoint import (
+     MambaPrefillCheckpointBuilder,
+     MambaPrefillCheckpointMetadata,
+@@ -39,6 +41,8 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
+ # 64-token chunk, so checkpoint offsets must be multiples of 64.
+ FLASHINFER_GDN_CHECKPOINT_ALIGNMENT = 64
+ 
++logger = init_logger(__name__)
++
+ 
+ def plan_flashinfer_checkpoints(
+     offsets: list[int], query_lens: list[int]
+@@ -162,6 +166,11 @@ class GDNRecoverSpecMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+     # row, and this cache group's GDNRecoverDeferTrackers.
+     recover_req_indices: torch.Tensor | None = None
+     recover_defer: Any = None
++    # Deferred commit: the batch's non-spec (prefill) rows and their
++    # request-table rows, so every cache group folds records still pending
++    # there before its prefill kernels read the state.
++    recover_nonspec_rows: torch.Tensor | None = None
++    recover_nonspec_req: torch.Tensor | None = None
+ 
+     def commit_recoverssm_state(
+         self, num_accepted_tokens: torch.Tensor
+@@ -293,6 +302,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             self._recover_req_idx_buf = torch.zeros(
+                 max_num_reqs, dtype=torch.int32, device=device
+             )
++        # VLLM_GDN_RECOVER_FOLD_DEBUG=1: count non-spec-row folds that found
++        # pending records (syncs on every call; logs each change and every
++        # 50th call; diagnostics only).
++        self._recover_fold_debug: torch.Tensor | None = None
++        self._recover_fold_debug_calls = 0
++        self._recover_fold_debug_rows = 0
++        if self._recover_fold and os.environ.get("VLLM_GDN_RECOVER_FOLD_DEBUG") == "1":
++            self._recover_fold_debug = torch.zeros(2, dtype=torch.int64, device=device)
+ 
+         self.use_full_cuda_graph: bool = (
+             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+@@ -818,9 +835,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             self._recover_flush(non_spec_state_indices_tensor)
+             if self._recover_fold:
+                 # Non-spec rows are prefills (a decoding request stays a spec
+-                # row): they never fold records, so drop any left in their
+-                # request-table rows (also reset at admission).
+-                self._recover_reset_rows(m, spec_sequence_masks_cpu)
++                # row). Their state is read by the prefill kernels, not by the
++                # fold verify: fold any records still pending in their
++                # request-table rows first (none after an admission reset).
++                rows_req = self._recover_nonspec_rows(m, spec_sequence_masks_cpu)
++                if rows_req is not None:
++                    recover_kwargs["recover_nonspec_rows"] = rows_req[0]
++                    recover_kwargs["recover_nonspec_req"] = rows_req[1]
++                    self._recover_fold_nonspec_rows(*rows_req, block_table_tensor)
+         attn_metadata = metadata_cls(
+             **recover_kwargs,
+             num_prefills=num_prefills,
+@@ -949,6 +971,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             if self._recover_fold:
+                 # Batch-level request rows are shared; trackers are per group.
+                 recover_kwargs["recover_defer"] = self._recover_defer
++                if m.recover_nonspec_rows is not None:
++                    self._recover_fold_nonspec_rows(
++                        m.recover_nonspec_rows, m.recover_nonspec_req, blk_table
++                    )
+         return replace(
+             m,
+             spec_state_indices_tensor=spec_indices,
+@@ -1035,27 +1061,79 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         async_tensor_h2d(req_idx.astype(np.int32), out=buf[:num_spec_decodes])
+         return buf
+ 
+-    def _recover_reset_rows(
++    def _recover_nonspec_rows(
+         self,
+         m: CommonAttentionMetadata,
+         spec_sequence_masks_cpu: torch.Tensor | None,
+-    ) -> None:
++    ) -> tuple[torch.Tensor, torch.Tensor] | None:
++        """(batch rows, request-table rows) of the non-spec rows, on device."""
+         assert self._recover_defer is not None
+         if m.req_idx is None:
+-            return
++            return None
+         req_idx = np.asarray(m.req_idx)[: m.num_reqs]
++        rows = np.arange(req_idx.shape[0], dtype=np.int64)
+         if spec_sequence_masks_cpu is not None:
+-            req_idx = req_idx[~spec_sequence_masks_cpu[: req_idx.shape[0]].numpy()]
+-        if req_idx.shape[0] == 0:
+-            return
+-        self._recover_defer.reset(
++            rows = rows[~spec_sequence_masks_cpu[: rows.shape[0]].numpy()]
++        if rows.shape[0] == 0:
++            return None
++        dev = self._recover_defer.pending.device
++        return (
++            async_tensor_h2d(torch.from_numpy(rows), device=dev, dtype=torch.int64),
+             async_tensor_h2d(
+-                torch.from_numpy(req_idx.astype(np.int64)),
+-                device=self._recover_defer.pending.device,
+-                dtype=torch.int64,
+-            )
++                torch.from_numpy(req_idx[rows].astype(np.int32)),
++                device=dev,
++                dtype=torch.int32,
++            ),
+         )
+ 
++    def _recover_group_ready(self) -> bool:
++        """The group's GDN layers are bound to a real KV cache (not during the
++        memory profile run)."""
++        ctx = self.vllm_config.compilation_config.static_forward_context
++        for name in self.layer_names:
++            kv = getattr(ctx.get(name), "kv_cache", None)
++            if (
++                not isinstance(kv, (list, tuple))
++                or len(kv) < 2
++                or not torch.is_tensor(kv[1])
++                or kv[1].numel() == 0
++                or kv[1].device.type != "cuda"
++            ):
++                return False
++        return True
++
++    def _recover_fold_nonspec_rows(
++        self,
++        rows: torch.Tensor,
++        req: torch.Tensor,
++        state_table: torch.Tensor,
++    ) -> None:
++        """Fold the records pending in the request-table rows `req` into the
++        running state of batch rows `rows` (state_table[rows, 0]) and clear
++        them, in this cache group. A no-op for rows with nothing pending."""
++        assert self._recover_defer is not None
++        if not self._recover_group_ready():
++            # Nothing can be pending before the KV cache exists.
++            self._recover_defer.reset(req)
++            return
++        slots = state_table[:, 0].index_select(0, rows)
++        group = self.recover_commit_group()
++        group.flush_deferred(slots, req, counter=self._recover_fold_debug)
++        if self._recover_fold_debug is not None:
++            self._recover_fold_debug_calls += 1
++            calls = self._recover_fold_debug_calls
++            nrows, nrec = self._recover_fold_debug.tolist()
++            if nrows != self._recover_fold_debug_rows or calls % 50 == 1:
++                self._recover_fold_debug_rows = nrows
++                logger.info(
++                    "GDN recover fold debug (group %s): non-spec row folds: "
++                    "%d calls, %d rows with pending records, %d records",
++                    self.layer_names[0],
++                    calls,
++                    nrows,
++                    nrec,
++                )
++
+     def _recover_flush(self, slots: torch.Tensor | None) -> None:
+         """Fold the pending records of slots read outside the spec verify
+         (prefill / non-spec decode rows) and reset their ring trackers.

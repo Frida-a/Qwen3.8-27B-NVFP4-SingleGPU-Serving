@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:47:57 -0800
+Subject: [PATCH] [Config] VLLM_KV_K8V4 env switch for the k8v4 KV cache
+
+=1 serves an fp8/fp8_e4m3 --kv-cache-dtype as k8v4; =0 serves k8v4 as
+fp8_e4m3 (env off-switch). Unset changes nothing. Lets env-only A/B
+harnesses (RTX PRO 6000 kernel_ab) toggle the cache format on one command line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/config/cache.py | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index c8780a51c..075f8440b 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -6,6 +6,7 @@ from dataclasses import field
+ from functools import cache
+ from typing import Any, ClassVar, Literal, Protocol, get_args, runtime_checkable
+ 
++import os
+ import torch
+ from pydantic import Field, field_validator, model_validator
+ 
+@@ -505,6 +506,16 @@ class CacheConfig:
+     @field_validator("cache_dtype", mode="after")
+     @classmethod
+     def _validate_cache_dtype(cls, cache_dtype: CacheDType | str) -> CacheDType | str:
++        # QW38 K8V4 env switch (A/B harnesses toggle env, not CLI):
++        # VLLM_KV_K8V4=1 serves an fp8/fp8_e4m3 request as k8v4; =0 serves a
++        # k8v4 request as fp8_e4m3 (off-switch). Unset: no change.
++        k8v4_env = os.environ.get("VLLM_KV_K8V4", "")
++        if k8v4_env == "1" and cache_dtype in ("fp8", "fp8_e4m3"):
++            logger.warning("VLLM_KV_K8V4=1: kv cache dtype %s -> k8v4", cache_dtype)
++            cache_dtype = "k8v4"
++        elif k8v4_env == "0" and cache_dtype == "k8v4":
++            logger.warning("VLLM_KV_K8V4=0: kv cache dtype k8v4 -> fp8_e4m3")
++            cache_dtype = "fp8_e4m3"
+         if not is_known_kv_cache_dtype(cache_dtype):
+             raise ValueError(
+                 f"Invalid kv_cache_dtype: {cache_dtype!r}. "

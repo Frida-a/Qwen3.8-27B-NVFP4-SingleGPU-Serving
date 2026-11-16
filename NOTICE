@@ -1,0 +1,23 @@
+Qwen3.8-27B NVFP4 single-GPU serving (QW38)
+Copyright 2026 Frida Hou
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository contains:
+
+1. patches/: modifications to vLLM (https://github.com/vllm-project/vllm), Copyright the vLLM project contributors,
+   licensed under Apache-2.0. The patches apply to upstream commit f5d93296c8ec82b7e7dabdb308d24d43cb1907bf and are
+   offered under Apache-2.0. Several of them target FlashInfer kernels and APIs (https://github.com/flashinfer-ai/flashinfer,
+   Apache-2.0); no FlashInfer source is included.
+
+2. recipes/: scripts that drive NVIDIA Model Optimizer (https://github.com/NVIDIA/Model-Optimizer, Apache-2.0).
+   recipes/a2_gdn_nvfp4_lh_nolm.yaml follows ModelOpt's recipe schema; the reference recipe it extends ships with
+   ModelOpt (modelopt_recipes/models/Qwen/Qwen3.8-27B/ptq/nvfp4_w4a4_mlp_fp8_attn_local_hessian.yaml).
+
+3. harness/: scripts that call AIPerf (https://github.com/ai-dynamo/aiperf, Apache-2.0) and NeMo Gym
+   (https://github.com/NVIDIA-NeMo/Gym, Apache-2.0). Benchmark data is not included; each benchmark keeps its own license
+   and access terms (GPQA and HLE are gated).
+
+Models referenced (not included): Qwen/Qwen3.8-27B (Apache-2.0, Copyright Alibaba Cloud);
+nvidia/Qwen3.8-27B-NVFP4 (Apache-2.0); z-lab/Qwen3.8-27B-DFlash2 (Apache-2.0); maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal
+(Apache-2.0). Results for third-party fine-tunes are reported as numbers only; no weights or derivatives are distributed.

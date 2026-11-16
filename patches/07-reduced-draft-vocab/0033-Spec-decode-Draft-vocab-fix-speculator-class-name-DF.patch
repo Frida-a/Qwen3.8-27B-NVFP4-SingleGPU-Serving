@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:37:59 -0800
+Subject: [PATCH] [Spec decode] Draft vocab: fix speculator class name; DFlash2
+ candidate top-k over the subset (B17)
+
+Fix a NameError in the override check (the base is DraftModelSpeculator).
+DFlash2 takes its K candidates from the reduced head's top-k (target ids
+via the subset map). Its proposal is the walk over those K candidates and
+the draft logits cache holds only them, so verification is unchanged. Hooks
+let a speculator name its logits processor and skip the -inf scatter rows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../worker/gpu/spec_decode/dflash2/config.py  |  1 +
+ .../gpu/spec_decode/dflash2/speculator.py     | 25 ++++++++++++++++++-
+ vllm/v1/worker/gpu/spec_decode/speculator.py  | 24 ++++++++++++++----
+ 3 files changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/config.py b/vllm/v1/worker/gpu/spec_decode/dflash2/config.py
+index 595ee4b87..a6fbfb9ab 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/config.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/config.py
+@@ -9,3 +9,4 @@ class DFlash2SpeculatorConfig(DFlashSpeculatorConfig):
+     )
+     # Draft-side watermarking doesn't cover candidate-head drafting yet.
+     supports_watermarking = False
++    supported_options = DFlashSpeculatorConfig.supported_options | {"draft_vocab_ids"}
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index e0d12efca..174561a23 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -4,6 +4,7 @@
+ from typing import Any
+ 
+ import torch
++import torch.nn as nn
+ 
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+@@ -205,6 +206,28 @@ class DFlash2Speculator(DFlashSpeculator):
+             self.max_num_reqs, self.num_speculative_steps, self.top_k, device
+         )
+ 
++    # Reduced draft vocabulary: the candidate top-k is taken over the subset
++    # rows only. The proposal is the walk over those K candidates either way
++    # (the draft logits cache holds just them), so verification is unchanged.
++    _draft_vocab_own_path = True
++
++    def _draft_vocab_logits_processor(self) -> nn.Module | None:
++        return getattr(self.model, "candidate_logits_processor", None)
++
++    def _draft_vocab_needs_full_rows(self) -> bool:
++        return False
++
++    def _compute_candidates(
++        self, hidden_states: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        if self.draft_vocab is None:
++            return self.model.compute_candidates(hidden_states)
++        dv = self.draft_vocab
++        sub_ids, values = dv.logits_processor.get_top_k_tokens(
++            dv.head, hidden_states, self.top_k
++        )
++        return dv.to_target(sub_ids), values
++
+     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+         # fp32 so the walk and the rejection that checks it read the same
+         # distribution; -inf because the cache kernel writes only the K
+@@ -231,7 +254,7 @@ class DFlash2Speculator(DFlashSpeculator):
+         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
+             num_reqs, self.num_speculative_steps, -1
+         )
+-        candidate_ids, unary_logits = self.model.compute_candidates(
++        candidate_ids, unary_logits = self._compute_candidates(
+             hidden_states.flatten(0, 1)
+         )
+         candidate_ids = candidate_ids.view(
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index efb1bcd02..2fd97f909 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -347,21 +347,23 @@ class DraftModelSpeculator(BaseSpeculator):
+                 path,
+             )
+             return
+-        if type(self).compute_draft_logits is not Speculator.compute_draft_logits:
++        if (
++            not self._draft_vocab_own_path
++            and type(self).compute_draft_logits
++            is not DraftModelSpeculator.compute_draft_logits
++        ):
+             raise NotImplementedError(
+                 f"draft_vocab_ids is not supported by {type(self).__name__}, "
+                 "which computes its own draft logits."
+             )
+         head = getattr(self.model, "lm_head", None)
+-        logits_processor = getattr(self.model, "logits_processor", None)
++        logits_processor = self._draft_vocab_logits_processor()
+         if head is None or logits_processor is None:
+             raise NotImplementedError(
+                 "draft_vocab_ids needs a drafter with lm_head and "
+                 f"logits_processor; {type(self.model).__name__} has none."
+             )
+-        need_full_rows = (
+-            self.draft_logits is not None or self.acceptance_estimator is not None
+-        )
++        need_full_rows = self._draft_vocab_needs_full_rows()
+         self.draft_vocab = build_draft_vocab_head(
+             self.vllm_config,
+             head,
+@@ -378,6 +380,18 @@ class DraftModelSpeculator(BaseSpeculator):
+             else None,
+         )
+ 
++    # A speculator that consumes `self.draft_vocab` itself (not via
++    # sample_draft) sets this and overrides the two hooks below as needed.
++    _draft_vocab_own_path: bool = False
++
++    def _draft_vocab_logits_processor(self) -> nn.Module | None:
++        return getattr(self.model, "logits_processor", None)
++
++    def _draft_vocab_needs_full_rows(self) -> bool:
++        """Whether draft steps need full-vocabulary rows (probabilistic drafts
++        or the acceptance estimator), i.e. the -inf scatter buffer."""
++        return self.draft_logits is not None or self.acceptance_estimator is not None
++
+     def free_unused_weights(self, target_model: nn.Module) -> None:
+         """Free the draft weights this instance never reads. The model runner
+         calls this after `load_model` (and its overrides) and EPLB setup."""

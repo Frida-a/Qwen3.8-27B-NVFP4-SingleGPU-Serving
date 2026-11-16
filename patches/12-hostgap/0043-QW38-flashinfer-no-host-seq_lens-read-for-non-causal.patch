@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frida Hou <Frida-a@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:44:03 -0800
+Subject: [PATCH] [QW38] flashinfer: no host seq_lens read for non-causal
+ trtllm-api decode-only (draft) batches
+
+On SM120 the DFlash2 drafter uses XQA decode with eager metadata rebuild;
+build() called seq_lens.cpu() because all_uses_trtllm requires causal,
+syncing the host with the target forward every step (1.7-2.2 ms/step host
+gap on RTX PRO 6000 (SM120)). The XQA path reads seq_lens on the GPU only, so the host copy
+was unused. Kernels and inputs unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/attention/backends/flashinfer.py | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index f70a8f398..cbed475a5 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -1831,7 +1831,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         # When all attention (both prefill and decode) uses TRTLLM,
+         # seq_lens_cpu is not needed since TRTLLM paths use GPU tensors
+         # (block_tables, seq_lens) directly.
+-        needs_seq_lens_cpu = self.use_dcp or not all_uses_trtllm
++        # A non-causal (draft) batch routed entirely to XQA/trtllm-gen decode
++        # also reads seq_lens and block tables on the GPU only. Reading
++        # seq_lens on the host here would sync with the in-flight target
++        # forward every draft step (QW38 host gap on SM120).
++        noncausal_trtllm_decode_only = (
++            not causal
++            and num_prefills == 0
++            and num_decodes > 0
++            and decode_with_flashinfer_trtllm_api
++        )
++        needs_seq_lens_cpu = self.use_dcp or not (
++            all_uses_trtllm or noncausal_trtllm_decode_only
++        )
+         if needs_seq_lens_cpu:
+             if (
+                 self._num_speculative_tokens == 0
