@@ -7,7 +7,9 @@ import argparse, json, re, time, concurrent.futures as cf
 from openai import OpenAI
 ap = argparse.ArgumentParser(); ap.add_argument("--base", default="http://localhost:8000"); ap.add_argument("--data", required=True)
 ap.add_argument("--out", required=True); ap.add_argument("--compare"); ap.add_argument("--n", type=int, default=20); ap.add_argument("--max-tokens", type=int, default=16384); ap.add_argument("--conc", type=int, default=0, help="client concurrency (default: all n at once)")
-a = ap.parse_args(); c = OpenAI(base_url=a.base + "/v1", api_key="x", timeout=7200)
+a = ap.parse_args()
+import os; os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)   # create the output dir before the long run
+c = OpenAI(base_url=a.base + "/v1", api_key="x", timeout=7200)
 rows = [json.loads(l) for l in open(a.data)][: a.n]
 def one(r):
     p = r["question"].strip() + "\n\n" + r["options_text"].strip() + "\n\nPlease reason step by step, and put the letter of your final answer within \\boxed{}."

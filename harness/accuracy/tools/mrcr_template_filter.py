@@ -11,6 +11,7 @@ On the measured build this turned 155 rows into 139 (2/4/8 needles: 52/43/44), t
 import argparse
 import collections
 import json
+import os
 
 from transformers import AutoTokenizer
 
@@ -30,6 +31,7 @@ for line in open(a.inp):
         ids = ids["input_ids"]
     if len(ids) <= a.max_templated:
         kept.append(line if line.endswith("\n") else line + "\n"); lens.append(len(ids)); by_needles[r.get("n_needles")] += 1
+os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
 with open(a.out, "w") as f:
     f.writelines(kept)
 print(f"{n_in} -> {len(kept)} rows; needles {dict(sorted(by_needles.items()))}; "

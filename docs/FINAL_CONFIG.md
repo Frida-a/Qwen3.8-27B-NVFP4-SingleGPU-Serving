@@ -25,7 +25,7 @@ Two profiles share one vLLM build and one checkpoint and differ only in flags an
 | GB300 image | arm64 build of the same nightly, `vllm/vllm-openai@sha256:c68112d825ebdc6c856ff2e5d22bf514d278194a734baeb3b5f76d1ea35c6355`, with the measured build's patched Python package on top, run under Slurm with `vllm serve` and the flags below (`BASE_IMAGE=` that digest in `build_image.sh`; that build path itself is untested on arm64) |
 | tuning data | `harness/serve/tuning/` (FlashInfer GEMM tactic store + 6 Triton FLA picks, RTX PRO 6000 Max-Q at 250 W); used by `serve.sh` by default, see section 3 |
 | checkpoint | `a2gdn-lc32k-mtpa4` (recipes/; output sha256 in `recipes/SHA256SUMS`) |
-| drafter (latency) | `maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal` @ `bd7a934213c47a9e7ef69eef36bb3325f47fd1f1` |
+| drafter (latency) | `maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal` @ `bd7a934213c47a9e7ef69eef36bb3325f47fd1f1` (sha256 of its files in `recipes/SHA256SUMS-drafter`; `model.safetensors` 2228b9b2…df26 = the Hub LFS sha256 at that revision) |
 
 The overlay contains only Python and Triton changes; no rebuild of compiled extensions is needed.
 

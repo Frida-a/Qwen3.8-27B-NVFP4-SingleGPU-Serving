@@ -39,6 +39,7 @@ hf download frida404/Qwen3.8-27B-NVFP4-LC32K --local-dir models/a2gdn-lc32k-mtpa
 (cd models/a2gdn-lc32k-mtpa4 && sha256sum -c ../../recipes/SHA256SUMS)                # 7 files OK
 hf download maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal --revision bd7a934213c47a9e7ef69eef36bb3325f47fd1f1 \
   --local-dir models/dflash2-nvfp4
+(cd models/dflash2-nvfp4 && sha256sum -c ../../recipes/SHA256SUMS-drafter)          # 3 files OK
 
 sudo nvidia-smi -i 0 -pl 250                                     # the measured configuration: Max-Q at 250 W
 
@@ -68,8 +69,9 @@ them off.
   delete what it leaves. Relative paths are resolved against the current directory.
 - `NAME` sets the container name (default `qw38-$PROFILE-g$GPU`, which collides if two checkouts serve on one GPU id);
   `DOCKER_ARGS` adds `docker run` flags, e.g. `DOCKER_ARGS="--cpuset-cpus 24-35"`.
-- `COMPILE_CACHE=/dir` keeps vLLM's torch.compile cache and the Triton kernel cache across boots (each cold boot
-  otherwise recompiles for several minutes). The measurements booted cold. If `SAVE_TACTICS` is also set, the Triton
+- `COMPILE_CACHE=/dir` keeps the Triton / JIT kernel cache across boots (the profiles run `CompilationMode.NONE`, so
+  there is no torch.compile cache to keep). Default profile on the RTX PRO 6000: boot to `/health` 221 s cold, 111 s
+  on the second boot with the cache. The measurements booted cold. If `SAVE_TACTICS` is also set, the Triton
   cache goes to `SAVE_TACTICS/triton` instead of `COMPILE_CACHE/triton`.
 - GB300 / arm64: `serve.sh` is docker-only and `build_image.sh` defaults to the amd64 base. The GB300 accuracy runs used
   the arm64 image of the same nightly (`BASE_IMAGE` digest in the header of `build_image.sh`) under Slurm, running

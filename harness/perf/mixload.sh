@@ -6,8 +6,8 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PORT=$1; IFS=: read BI BO BC <<< "$2"; IFS=: read PI PN <<< "$3"; DELAY=${4:-90}; OUT=$5
-SEED=1001 REQ_MULT=8 MIN_REQ=10 bash $HERE/sweep_aiperf.sh $PORT $BI $BO ${OUT}_bg "$BC" > /dev/null 2>&1 & BG=$!
+SEED=1001 REQ_MULT=8 MIN_REQ=10 bash "$HERE/sweep_aiperf.sh" $PORT $BI $BO "${OUT}_bg" "$BC" > /dev/null 2>&1 & BG=$!
 sleep $DELAY
-SEED=3201 REQ_MULT=1 MIN_REQ=${PN:-3} bash $HERE/sweep_aiperf.sh $PORT $PI 1 ${OUT}_probe 1
+SEED=3201 REQ_MULT=1 MIN_REQ=${PN:-3} bash "$HERE/sweep_aiperf.sh" $PORT $PI 1 "${OUT}_probe" 1
 kill -0 $BG 2>/dev/null && echo "background still running after the probes: OK" || echo "WARN: background finished before the probes ended"
 wait $BG

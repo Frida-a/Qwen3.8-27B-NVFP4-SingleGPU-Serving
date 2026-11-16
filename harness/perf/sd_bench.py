@@ -14,6 +14,7 @@ for k, t, d in [("port", int, None), ("conc", int, None), ("n", int, None), ("ma
 ap.add_argument("--save-text", action="store_true")
 ap.add_argument("--profile", action="store_true", help="POST /start_profile before and /stop_profile after the run (one nsys window)")
 a = ap.parse_args(); S = json.load(open(a.sets))
+import os; os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)   # create the output dir before the long run
 base = f"http://{a.host}:{a.port}"
 c = OpenAI(base_url=base + "/v1", api_key="x", timeout=7200)
 def counters():

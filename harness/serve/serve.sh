@@ -42,9 +42,10 @@
 #                  TRITON_SEED=$SAVE_TACTICS/triton. This is how to make a store for another GPU or build.
 #                  If COMPILE_CACHE is also set, SAVE_TACTICS/triton (not COMPILE_CACHE/triton) is the Triton cache.
 # Other hooks:
-#   COMPILE_CACHE  host directory kept across boots for VLLM_CACHE_ROOT (COMPILE_CACHE/vllm, torch.compile artifacts)
-#                  and the Triton kernel cache (COMPILE_CACHE/triton), so later boots skip most compilation. Off by
-#                  default (the measurements booted cold).
+#   COMPILE_CACHE  host directory kept across boots for the Triton / JIT kernel cache (COMPILE_CACHE/triton) and
+#                  VLLM_CACHE_ROOT (COMPILE_CACHE/vllm; nearly empty, the profiles run CompilationMode.NONE, so there is
+#                  no torch.compile cache). Measured on the RTX PRO 6000, default profile: boot to /health 221 s cold,
+#                  111 s on the second boot. Off by default (the measurements booted cold).
 #   SAVE_TACTICS and COMPILE_CACHE hold files that a root container with host networking loads and executes (compiled
 #   kernels, tactic choices). Put them on a local disk under a parent directory only you can enter (chmod 700). The
 #   script creates the subdirectories (flashinfer/, triton/, vllm/) and, for the default root container, makes the ones
@@ -143,11 +144,13 @@ DX=(); [ -n "${DOCKER_ARGS:-}" ] && read -r -a DX <<< "$DOCKER_ARGS"
 # removable by you (022 with AS_USER=1, where the files are yours);
 # seed the FlashInfer store (only if the target is empty, so a SAVE_TACTICS dir is resumed, not overwritten) and copy
 # the Triton autotune picks with their <hash>/ dirs (overwriting, so pinned picks win over a persistent cache).
+# --no-preserve=mode: copies get 0666/0777 & ~umask instead of the seed's 0644/0755, so a seeded SAVE_TACTICS store
+# written by the root container ("nobody" on root-squashed NFS) stays deletable by you and writable by AS_USER=1 boots.
 PRE='umask "$QW38_UMASK"; set -e; mkdir -p "$HOME" "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR" "$TRITON_CACHE_DIR"
 if [ -d /seed/flashinfer ] && [ -z "$(ls -A "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR")" ]; then
-  cp -rf /seed/flashinfer/. "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"/; echo "qw38 serve.sh: FlashInfer store seeded"; fi
+  cp -rf --no-preserve=mode /seed/flashinfer/. "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"/; echo "qw38 serve.sh: FlashInfer store seeded"; fi
 if [ -d /seed/triton ]; then n=0; for f in $(cd /seed/triton && find . -name "*.autotune.json"); do
-  mkdir -p "$TRITON_CACHE_DIR/$(dirname $f)"; cp -f /seed/triton/$f "$TRITON_CACHE_DIR/$f"; n=$((n+1)); done
+  mkdir -p "$TRITON_CACHE_DIR/$(dirname $f)"; cp -f --no-preserve=mode /seed/triton/$f "$TRITON_CACHE_DIR/$f"; n=$((n+1)); done
   echo "qw38 serve.sh: $n Triton autotune picks seeded"; fi
 exec vllm "$@"'
 

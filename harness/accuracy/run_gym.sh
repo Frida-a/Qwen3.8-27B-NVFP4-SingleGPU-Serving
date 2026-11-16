@@ -10,13 +10,15 @@
 #   LIMIT=<n>   passes `--limit n` to every benchmark, for smoke tests. Gym v0.7.0 applies it to the input rows
 #               (tasks) before repeating them, so a run makes LIMIT x repeats rollouts.
 #   GYM_EXTRA   extra `gym eval run` arguments / Hydra overrides, split on whitespace (e.g. "++some_key=value").
-#   Exit status: non-zero if any benchmark was skipped (no config) or failed; the others still run.
+#   Exit status: non-zero if any benchmark was skipped (no config) or failed; the others still run. A benchmark that
+#   fails with Gym's free-port race ("address already in use") is retried once.
 #
 # `++overwrite_metrics_conflicts=true`: Gym v0.7.0 keeps a metrics sidecar next to each built-in benchmark's data
 # (e.g. gpqa_diamond_benchmark_metrics.json, computed with that benchmark's own num_repeats). The num_repeats-1 run copy
 # below changes num_repeats, so Gym's data validation would abort with "Found conflicting aggregate metrics"; the
 # override (a top-level Gym config field, default false) lets Gym rewrite the sidecar instead. Note that this modifies
-# a file tracked in the Gym checkout (`git status` there shows it; `git checkout -- benchmarks` restores it).
+# a file tracked in the Gym checkout (`git status` there shows it; `git checkout -- benchmarks` restores it). Gym still
+# prints "Found conflicting aggregate metrics" (and writes a *_metrics_conflict.json) with the override on; not an error.
 #
 # Paths (checked against NeMo Gym v0.7.0): `--search-dir X` makes Gym look for `X/benchmarks/<name>/config.yaml`
 # (then the cwd and the Gym install), so X is this directory. Each benchmark runs from a generated copy,
@@ -41,13 +43,26 @@ for spec in "$@"; do
   # Gym multiplies a benchmark's own num_repeats with --num-repeats: run a num_repeats-1 copy (<name>_run).
   br=$(python "$T/repeat_overrides.py" "$cfg" "$EV" "$b" --abs-root "$ROOT") \
     || { echo "$b: repeat_overrides.py failed; skipped"; rc_all=1; continue; }
-  gym eval run --benchmark "$br" --search-dir "$EV" --split benchmark \
-    --config responses_api_models/vllm_model/configs/vllm_model.yaml --config "$EV/configs/thinking_on.yaml" \
-    --model-url "$MODEL_URL" --model qw38 --model-api-key dummy \
-    --output "$d/rollouts.jsonl" --num-repeats "$n" --concurrency "$CONC" \
-    --temperature 1.0 --top-p 0.95 --max-output-tokens "$mt" ++num_repeats_add_seed=true \
-    ++reuse_existing_data_preparation=true ++overwrite_metrics_conflicts=true ${LIMIT:+--limit "$LIMIT"} \
-    ${XG[@]+"${XG[@]}"} > "$d/gym.log" 2>&1 || { echo "$b failed, see $d/gym.log"; rc_all=1; continue; }
+  gym_run() {
+    gym eval run --benchmark "$br" --search-dir "$EV" --split benchmark \
+      --config responses_api_models/vllm_model/configs/vllm_model.yaml --config "$EV/configs/thinking_on.yaml" \
+      --model-url "$MODEL_URL" --model qw38 --model-api-key dummy \
+      --output "$d/rollouts.jsonl" --num-repeats "$n" --concurrency "$CONC" \
+      --temperature 1.0 --top-p 0.95 --max-output-tokens "$mt" ++num_repeats_add_seed=true \
+      ++reuse_existing_data_preparation=true ++overwrite_metrics_conflicts=true ${LIMIT:+--limit "$LIMIT"} \
+      ${XG[@]+"${XG[@]}"} > "$d/gym.log" 2>&1
+  }
+  rc=0; gym_run || rc=$?
+  # Gym v0.7.0 picks free ports for its local servers and can lose the race to another process ("[Errno 98] ...
+  # address already in use"; then "Process ... finished unexpectedly"). Retry such a failure once; the first log is
+  # kept as gym.portclash.log (and any partial rollouts as rollouts.portclash.jsonl).
+  if [ $rc != 0 ] && grep -q "address already in use" "$d/gym.log"; then
+    echo "$b: Gym port race (address already in use); retrying once"
+    mv "$d/gym.log" "$d/gym.portclash.log"
+    if [ -e "$d/rollouts.jsonl" ]; then mv "$d/rollouts.jsonl" "$d/rollouts.portclash.jsonl"; fi
+    rc=0; gym_run || rc=$?
+  fi
+  [ $rc = 0 ] || { echo "$b failed, see $d/gym.log"; rc_all=1; continue; }
   GYM=$GYM python3 "$T/summarize.py" "$d" "$mt" || true
 done
 [ $rc_all = 0 ] || echo "run_gym.sh: at least one benchmark failed or was skipped" >&2

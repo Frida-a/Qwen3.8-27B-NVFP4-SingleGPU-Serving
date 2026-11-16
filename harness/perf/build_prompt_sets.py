@@ -20,6 +20,7 @@ import argparse, hashlib, json, random
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", required=True); ap.add_argument("--gpqa-jsonl"); ap.add_argument("--n", type=int, default=64)
 a = ap.parse_args(); N = a.n; out = {}
+import os; os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)   # create the output dir before the long run
 from datasets import load_dataset
 
 if a.gpqa_jsonl:

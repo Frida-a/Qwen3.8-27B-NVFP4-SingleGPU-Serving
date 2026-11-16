@@ -46,6 +46,7 @@ hf download frida404/Qwen3.8-27B-NVFP4-LC32K --local-dir models/a2gdn-lc32k-mtpa
 (cd models/a2gdn-lc32k-mtpa4 && sha256sum -c ../../recipes/SHA256SUMS)
 hf download maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal --revision bd7a934213c47a9e7ef69eef36bb3325f47fd1f1 \
   --local-dir models/dflash2-nvfp4
+(cd models/dflash2-nvfp4 && sha256sum -c ../../recipes/SHA256SUMS-drafter)
 
 # 3. Serve (default profile for throughput; latency profile for <= 16 concurrent requests). serve.sh boots with the
 #    shipped FlashInfer/Triton tuning data (harness/serve/tuning, RTX PRO 6000 Max-Q): see the note below.
